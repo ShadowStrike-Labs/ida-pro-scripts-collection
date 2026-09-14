@@ -58,6 +58,3 @@ Pull requests are welcome.
 * The debugger-oriented scripts (`auto_tailjump.py`, `pass_exceptions.py`) need
   an active debugging session; the rest work statically.
 
-## License
-
-MIT - see `LICENSE` (add one before publishing if you want it explicit).
