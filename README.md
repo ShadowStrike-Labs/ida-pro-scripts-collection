@@ -20,6 +20,8 @@ IDA_PRO_SCRIPTS/
 │   └── function_conditions.py       # map every condition in the current function
 ├── scanning/
 │   └── segment_scanner.py           # hunt PE/code/magic signatures in chosen segments
+├── integrity/
+│   └── iat_hooks.py                 # detect IAT hooks vs the real (live) exports
 ├── debugging/
 │   ├── auto_tailjump.py             # peel packer/VM layers + instrument handlers
 │   └── pass_exceptions.py           # pass all debugger exceptions to the app
