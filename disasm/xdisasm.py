@@ -30,12 +30,12 @@
 #    end   : omit and pass count=N to decode N instructions instead of a range.
 #    Addresses accept ints or hex strings.
 #
-#  Options on disasm_as: comment=True, items=True, color=True, echo=False.
+#  Options on disasm_as: comment=True, items=True, color=False, echo=False.
 #    items reforms the range into one data item per decoded instruction, so each
 #    instruction is a single line carrying its `[mode] ...` comment (reversible
 #    via clear_annotations, which re-analyses the range in its native width).
 #    echo=False keeps the Output window quiet; the decoded data stays in
-#    get_last(). Pass echo=True (or use dis()) for a printed listing.
+#    get_last(). color=True tints the whole annotated range (off by default).
 #
 #  Hotkey
 #    Ctrl-Alt-X   annotate the current selection (or current function) in the
@@ -241,7 +241,7 @@ def _xd_prepare(start, end, mode, count):
 
 
 def disasm_as(start, end=None, mode=None, count=None, comment=True,
-              items=True, color=True, echo=False):
+              items=True, color=False, echo=False):
     """Annotate [start, end) (or `count` instructions) with disassembly decoded
     in `mode`, one line per instruction carrying a `[mode] ...` comment.
 
