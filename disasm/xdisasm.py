@@ -30,10 +30,12 @@
 #    end   : omit and pass count=N to decode N instructions instead of a range.
 #    Addresses accept ints or hex strings.
 #
-#  Options on disasm_as: comment=True, undefine=True, color=True, echo=True.
-#    undefine converts the range to raw bytes first so the comments line up and
-#    IDA's mis-decoded instructions stop cluttering the view (reversible via
-#    clear_annotations, which re-analyses the range in its native width).
+#  Options on disasm_as: comment=True, items=True, color=True, echo=False.
+#    items reforms the range into one data item per decoded instruction, so each
+#    instruction is a single line carrying its `[mode] ...` comment (reversible
+#    via clear_annotations, which re-analyses the range in its native width).
+#    echo=False keeps the Output window quiet; the decoded data stays in
+#    get_last(). Pass echo=True (or use dis()) for a printed listing.
 #
 #  Hotkey
 #    Ctrl-Alt-X   annotate the current selection (or current function) in the
@@ -57,6 +59,9 @@ _XD_TAG = "[xdisasm]"
 _XD_MARK = {16: "[x16] ", 32: "[x86] ", 64: "[x64] "}
 _XD_COLOR = 0xF0E0C0                     # BGR: pale cyan tint for annotated lines
 _DELIT_SIMPLE = getattr(ida_bytes, "DELIT_SIMPLE", 0x0000)
+
+_xd_last = []                            # instructions from the most recent run
+_xd_last_switches = []                   # hits from the most recent scan
 
 
 # ----------------------------------------------------------------------------
@@ -206,65 +211,96 @@ def _xd_is_ours(ea):
     return any(cmt.startswith(m) for m in _XD_MARK.values())
 
 
-def disasm_as(start, end=None, mode=None, count=None, comment=True,
-              undefine=True, color=True, echo=True):
-    """Decode [start, end) (or `count` instructions from start) in `mode` and
-    annotate each instruction with the decoded line. Returns the instruction
-    list. Non-destructive except for the optional `undefine`."""
+def _xd_prepare(start, end, mode, count):
+    """Resolve arguments, read the bytes and decode. Returns
+    (s, bits, insns, real_end) or None on error (with a logged reason)."""
     if not _XD_HAVE_CS:
         _xd_log("capstone is not available in IDA's Python. Install it once: "
                 "<ida>\\python -m pip install capstone")
-        return []
+        return None
     s = _xd_addr(start)
     if s is None:
         _xd_log("bad start address %r" % (start,))
-        return []
+        return None
     bits = _xd_bits(mode) if mode is not None else _xd_default_mode(s)
     if bits is None:
         _xd_log("bad mode %r (use x86/x64/x16 or 32/64/16)" % (mode,))
-        return []
-
+        return None
     e = _xd_addr(end) if end is not None else None
     if e is not None and e <= s:
         _xd_log("end (%X) must be greater than start (%X)" % (e, s))
-        return []
-    if e is not None:
-        size = e - s
-    else:
-        size = (count or 64) * 15               # x86 max instruction length
+        return None
+    size = (e - s) if e is not None else (count or 64) * 15
     data = _xd_read(s, size)
-
     insns = _xd_decode(data, s, bits, count=(None if e is not None else (count or 64)))
     if not insns:
         _xd_log("nothing decoded at %X" % s)
-        return insns
+        return None
     real_end = insns[-1]["ea"] + insns[-1]["size"]
+    return s, bits, insns, real_end
 
-    if undefine:
-        ida_bytes.del_items(s, _DELIT_SIMPLE, real_end - s)
 
+def disasm_as(start, end=None, mode=None, count=None, comment=True,
+              items=True, color=True, echo=False):
+    """Annotate [start, end) (or `count` instructions) with disassembly decoded
+    in `mode`, one line per instruction carrying a `[mode] ...` comment.
+
+    Prints only a one-line summary; the decoded data is kept in get_last() and
+    nothing large is returned, so the console stays clean. Pass echo=True for a
+    full printed listing, or use dis() to print without changing the database."""
+    global _xd_last
+    prep = _xd_prepare(start, end, mode, count)
+    if prep is None:
+        return None
+    s, bits, insns, real_end = prep
     mark = _XD_MARK[bits]
+
+    if items:
+        ida_bytes.del_items(s, _DELIT_SIMPLE, real_end - s)
     for ins in insns:
+        if items and ins["size"] > 0:
+            try:                                # one data item -> one clean line
+                ida_bytes.create_data(ins["ea"], ida_bytes.FF_BYTE,
+                                      ins["size"], idaapi.BADADDR)
+            except Exception:
+                pass
         if comment:
             idc.set_cmt(ins["ea"], mark + ins["text"], 0)
         if color:
             idc.set_color(ins["ea"], idc.CIC_ITEM, _XD_COLOR)
     _xd_refresh()
+    _xd_last = insns
 
     if echo:
-        _xd_log("%d instruction(s) as %s over %X..%X:"
-                % (len(insns), mark.strip(), s, real_end))
         for ins in insns:
             hexb = " ".join("%02X" % b for b in ins["bytes"])[:23]
-            _xd_log("  %012X  %-24s %s" % (ins["ea"], hexb, ins["text"]))
-    _xd_log("done. clear_annotations(0x%X, 0x%X) to undo." % (s, real_end))
-    return insns
+            _xd_log("  %012X  %-24s %s%s" % (ins["ea"], hexb, mark, ins["text"]))
+    _xd_log("annotated %d instruction(s) as %s over %X..%X. "
+            "clear_annotations(0x%X, 0x%X) to undo; get_last() for the data."
+            % (len(insns), mark.strip(), s, real_end, s, real_end))
+    return None
 
 
 def dis(start, end=None, mode=None, count=None):
-    """Print the decoded listing only - no comments, no database changes."""
-    return disasm_as(start, end, mode, count, comment=False, undefine=False,
-                     color=False, echo=True)
+    """Print the decoded listing to Output only - no comments, no DB changes."""
+    global _xd_last
+    prep = _xd_prepare(start, end, mode, count)
+    if prep is None:
+        return None
+    s, bits, insns, real_end = prep
+    mark = _XD_MARK[bits]
+    _xd_log("%d instruction(s) as %s over %X..%X:"
+            % (len(insns), mark.strip(), s, real_end))
+    for ins in insns:
+        hexb = " ".join("%02X" % b for b in ins["bytes"])[:23]
+        _xd_log("  %012X  %-24s %s" % (ins["ea"], hexb, ins["text"]))
+    _xd_last = insns
+    return None
+
+
+def get_last():
+    """Return the instruction list from the most recent disasm_as()/dis()."""
+    return list(_xd_last)
 
 
 def find_mode_switches(start, end=None):
@@ -275,11 +311,13 @@ def find_mode_switches(start, end=None):
         return []
     e = _xd_addr(end) if end is not None else s + 0x400
     data = _xd_read(s, max(0, e - s))
+    global _xd_last_switches
     hits = _xd_find_switches(data, s)
     _xd_log("%d mode-switch candidate(s) in %X..%X:" % (len(hits), s, e))
     for ea, kind, detail in hits:
         _xd_log("  %012X  %-14s %s" % (ea, kind, detail))
-    return hits
+    _xd_last_switches = hits
+    return None
 
 
 def clear_annotations(start, end):
@@ -345,9 +383,10 @@ def _xd_bootstrap():
     if not _XD_HAVE_CS:
         _xd_log("WARNING: capstone not found in IDA's Python. Install it: "
                 "<ida>\\python -m pip install capstone")
-    _xd_log("ready. disasm_as(start, end, mode) annotates a range (Ctrl-Alt-X "
-            "does the selection); dis(...) prints only; find_mode_switches(...) "
-            "locates far jmp/retf; clear_annotations(start, end) undoes it.")
+    _xd_log("ready. disasm_as(start, end, mode) annotates each line in the IDA "
+            "view (Ctrl-Alt-X does the selection); dis(...) prints to Output; "
+            "get_last() returns the data; find_mode_switches(...) locates far "
+            "jmp/retf; clear_annotations(start, end) undoes it.")
 
 
 _xd_bootstrap()
