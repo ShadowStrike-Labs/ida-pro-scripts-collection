@@ -24,6 +24,8 @@ IDA_PRO_SCRIPTS/
 │   └── iat_hooks.py                 # detect IAT hooks vs the real (live) exports
 ├── disasm/
 │   └── xdisasm.py                   # annotate a range as x86/x64 (Heaven's Gate)
+├── strings/
+│   └── author_strings.py            # isolate author-written strings from library noise
 ├── debugging/
 │   ├── auto_tailjump.py             # peel packer/VM layers + instrument handlers
 │   └── pass_exceptions.py           # pass all debugger exceptions to the app
