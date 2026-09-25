@@ -24,12 +24,17 @@
 #
 #  Verdicts: AUTHOR, ARTIFACT (shown by default), LIBRARY, UNREF, NOISE.
 #
-#  Go binaries
-#    Go recovers package-qualified names (runtime.*, fmt.*, os.*, internal/*).
-#    These are auto-detected; the author's code is package `main`, so anything
-#    referenced only from other packages (the runtime, the stdlib, vendored
-#    deps) is library. If a target splits its logic into its own module
-#    packages, add them with set_author_packages('main', '<pkg>').
+#  Toolchains
+#    C/C++ (MSVC and GCC/Clang), Go, Rust and .NET AOT are handled. Managed and
+#    namespaced toolchains (Go/Rust/.NET) are auto-detected and attributed by
+#    package/crate/namespace: the author's code is package `main` (Go), the
+#    binary's own crate (Rust), or the app namespace (.NET); everything else is
+#    library. When the author crate/namespace cannot be auto-identified, nothing
+#    is labelled author until you name it - set_author_packages('<name>') - so a
+#    library string is never shown as the author's. toolchain() and coverage()
+#    report what was detected. Note: with no symbols (stripped/pure assembly)
+#    provenance falls back to FLIRT, and statically linked, unsignatured code
+#    cannot be told apart from author code - audit those with show_all=True.
 #
 #  Console interface
 #    author_strings(show_all=False)   scan and open a jump-list of author (and
@@ -63,18 +68,39 @@ _AS_TAG = "[authstr]"
 FUNC_LIB = getattr(idaapi, "FUNC_LIB", 0x00000004)
 FUNC_THUNK = getattr(idaapi, "FUNC_THUNK", 0x00000080)
 
-# ---- Go support -----------------------------------------------------------
-#  Go binaries recover full package-qualified names from the pclntab
-#  (runtime.*, fmt.*, os.*, internal/cpu.*, ...). None of those match the MSVC
-#  library patterns, so provenance needs a Go arm: the author's code lives in
-#  package `main`; every other package (runtime, the STL-equivalent stdlib, and
-#  vendored third-party deps) is not the author's. _AS_AUTHOR_PKGS is the set of
-#  package heads treated as author (extend it with set_author_packages() when a
-#  crackme splits logic into its own module packages).
-_AS_AUTHOR_PKGS = {"main"}
-_AS_GO_MODE = None                       # None = auto-detect, or True/False
+# ---- toolchain support -----------------------------------------------------
+#  Provenance is language-aware. Managed / namespaced toolchains embed the
+#  producing package/namespace in every symbol, so the author's code can be
+#  named exactly and everything else (runtime, standard library, bundled deps)
+#  treated as library:
+#    * Go        author = package `main`      (runtime.*, fmt.*, os.* = library)
+#    * Rust      author = the binary's crate  (core::/alloc::/std:: = library)
+#    * .NET AOT  author = the app namespace    (System.*/Microsoft.* = library)
+#    * C/C++     no namespace - FLIRT FUNC_LIB + mangled/CRT/STL content decide
+#    * assembly  no symbols - fall back to FLIRT + "must have a real referrer"
+#  For Rust/.NET the author crate/namespace is auto-detected from the entry
+#  symbol; when that is not possible the AUTHOR set stays empty (nothing is
+#  mislabelled) and coverage() tells you to name it with set_author_packages().
+_AS_AUTHOR_PKGS = None                    # None = auto; else a set of ns heads
+_AS_AUTHOR_AUTO = None                    # cached auto-detected author ns set
+_AS_GO_MODE = None                        # back-compat override for Go detection
+_AS_TC = None                             # cached detected toolchain
 _AS_DUMMY_PREFIX = ("sub_", "loc_", "unk_", "nullsub_", "j_", "def_",
-                    "__imp_", "unknown_libname", "byte_", "off_", "qword_")
+                    "__imp_", "unknown_libname", "byte_", "off_", "qword_",
+                    "dword_", "word_", "flt_", "dbl_", "stru_", "asc_")
+
+# runtime namespace heads that are never the author (lower-case)
+_AS_RUST_STD = frozenset({
+    "core", "std", "alloc", "hashbrown", "compiler_builtins", "panic_unwind",
+    "panic_abort", "backtrace", "addr2line", "gimli", "miniz_oxide", "object",
+    "rustc_demangle", "libc", "adler", "adler2", "memchr", "cfg_if", "unwind",
+    "proc_macro", "test", "rustc_std_workspace_core", "std_detect",
+    "allocator_api2",
+})
+_AS_DOTNET_LIB = frozenset({
+    "system", "microsoft", "internal", "interop", "s_p_corelib",
+    "system_private_corelib", "il", "windows", "mscorlib",
+})
 
 # verdict -> (label, BGR line colour, shown-by-default)
 _AS_META = {
@@ -106,6 +132,22 @@ _AS_LIB_SUBSTR = (
     "Stack around the variable", "stack cookie",
     "api-ms-win-", "ext-ms-win-", "ucrtbase", "vcruntime", "VCRUNTIME",
     "mscoree.dll", "MSVCP", "MSVCR",
+    # ---- Rust runtime / libstd fingerprints ----
+    "/rustc/", "library/core/src", "library/std/src", "library/alloc/src",
+    "called `Option::unwrap()`", "called `Result::unwrap()`",
+    "RUST_BACKTRACE", "internal error: entered unreachable code",
+    "index out of bounds: the len is", "attempt to add with overflow",
+    "attempt to subtract with overflow", "attempt to multiply with overflow",
+    "already borrowed", "already mutably borrowed",
+    "misaligned pointer dereference", "cargo/registry",
+    # ---- .NET runtime fingerprints ----
+    "System.Private.CoreLib", "Object reference not set to an instance",
+    "Index was outside the bounds of the array",
+    "Attempted to divide by zero",
+    "The runtime has encountered a fatal error",
+    # ---- GNU / libstdc++ fingerprints ----
+    "terminate called", "pure virtual method called", "basic_string::_M_",
+    "vector::_M_", "std::__throw", "GLIBCXX", "libstdc++",
 )
 # unmistakable library name/path fragments (case-insensitive)
 _AS_LIB_SUBSTR_CI = (
@@ -197,18 +239,24 @@ def _as_is_artifact(s):
 
 
 def _as_name_is_lib(name):
-    """Heuristic: does a function NAME look like CRT/STL/compiler code?"""
+    """Heuristic: does a function NAME look like CRT/STL/compiler code?
+    Covers both MSVC and Itanium (GCC/Clang) C++ runtimes."""
     if not name:
         return False
-    if "@@" in name or name.startswith("??"):
+    if "@@" in name or name.startswith("??"):        # MSVC mangling
         return True
     low = name.lower()
+    if low.startswith(("_znst", "_zn", "_zst", "_zik", "_zik0",
+                        "__cxa_", "__cxx", "_unwind_", "__gnu_cxx",
+                        "__gxx_", "_global__sub")):   # Itanium C++ / libgcc
+        return True
     prefixes = ("__scrt", "__acrt", "__crt", "_crt", "__security", "_rtc_",
                 "_xlen", "_xbad", "__std_", "std::", "_mtx", "_thrd", "_cnd",
                 "__isa_", "__guard", "_guard_", "__gshandler", "__c_specific",
                 "operator new", "operator delete", "type_info", "_cxxthrow",
                 "__castguard", "__vcrt", "__acrt_", "_woutput", "_output_l",
-                "_findpesection", "_validateimagebase", "__report_gsfailure")
+                "_findpesection", "_validateimagebase", "__report_gsfailure",
+                "__libc_", "__pthread_", "_dl_", "__tunable")
     return low.startswith(prefixes)
 
 
@@ -241,44 +289,169 @@ def _as_func_name(ea):
 
 
 def _as_is_go():
-    """Detect a Go binary (cached). Set explicitly with set_go_mode()."""
-    global _AS_GO_MODE
-    if _AS_GO_MODE is not None:
-        return _AS_GO_MODE
-    go = False
-    for sname in (".gopclntab", ".go.buildinfo", ".noptrdata", ".typelink",
-                  ".itablink"):
-        try:
-            if ida_segment.get_segm_by_name(sname):
-                go = True
-                break
-        except Exception:
-            pass
-    if not go:
-        seen = 0
-        for fea in idautils.Functions():
-            nm = ida_funcs.get_func_name(fea) or ""
-            if nm.startswith(("runtime.", "runtime_")):
-                go = True
-                break
-            seen += 1
-            if seen > 3000:
-                break
-    _AS_GO_MODE = go
-    return go
+    """Back-compat: True when the detected toolchain is Go."""
+    return _as_toolchain() == "go"
+
+
+def _as_toolchain():
+    """Detect the producing toolchain (cached): 'go' | 'rust' | 'dotnet' |
+    'msvc' | 'gnu' | 'unknown'. Override with set_toolchain()."""
+    global _AS_TC
+    if _AS_TC is not None:
+        return _AS_TC
+    if _AS_GO_MODE is True:
+        _AS_TC = "go"
+        return _AS_TC
+    segs = set()
+    try:
+        for i in range(ida_segment.get_segm_qty()):
+            s = ida_segment.getnseg(i)
+            if s:
+                segs.add((ida_segment.get_segm_name(s) or "").lower())
+    except Exception:
+        pass
+    if segs & {".gopclntab", ".go.buildinfo", ".typelink", ".itablink"}:
+        _AS_TC = "go"
+        return _AS_TC
+    if segs & {".managedcode", "hydrated", ".managed"}:
+        _AS_TC = "dotnet"
+        return _AS_TC
+
+    go = rust = dotnet = gnu = msvc = 0
+    seen = 0
+    for fea in idautils.Functions():
+        nm = ida_funcs.get_func_name(fea) or ""
+        low = nm.lower()
+        if nm.startswith(("runtime.", "runtime_")) or ".goroutine" in low:
+            go += 1
+        if nm.startswith(("S_P_CoreLib", "System_Private_CoreLib")) \
+                or "rhpnewfast" in low or low.startswith(("system_", "system.")):
+            dotnet += 1
+        if ("_zn" in low and ("4core" in low or "3std" in low or "5alloc" in low
+                              or "17h" in low)) or nm.startswith("_R") \
+                or low.startswith(("core::", "std::", "alloc::")):
+            rust += 1
+        if low.startswith(("_znst", "_zst", "__cxa_", "__gnu_cxx")):
+            gnu += 1
+        if nm.startswith("??") or "@@" in nm:
+            msvc += 1
+        seen += 1
+        if seen > 4000:
+            break
+    scores = {"go": go, "dotnet": dotnet, "rust": rust, "gnu": gnu, "msvc": msvc}
+    best = max(scores, key=scores.get)
+    _AS_TC = best if scores[best] > 0 else "unknown"
+    return _AS_TC
 
 
 def _as_go_pkg(name):
-    """Extract the Go package head from an (IDA-sanitised) symbol, or None.
+    """Go package head from an (IDA-sanitised) symbol, or None.
     'runtime.mallocgc' -> 'runtime'; 'fmt._ptr_pp.doPrintf' -> 'fmt';
-    'internal_cpu.doinit' -> 'internal_cpu'; 'main._ptr_T.m' -> 'main'.
-    IDA dummy names (sub_, loc_, ...) return None so they are not mistaken
-    for a package."""
+    'internal_cpu.doinit' -> 'internal_cpu'; 'main._ptr_T.m' -> 'main'."""
     if not name or name.startswith(_AS_DUMMY_PREFIX):
         return None
     head = name.split(".", 1)[0] if "." in name else name.split("_", 1)[0]
     head = head.split("_ptr_", 1)[0]
     return head or None
+
+
+def _as_rust_head(name):
+    """Rust crate head from a demangled or legacy-mangled symbol, or None."""
+    if not name or name.startswith(_AS_DUMMY_PREFIX):
+        return None
+    if "::" in name:
+        head = name.split("::", 1)[0].lstrip("<").strip()
+        if " as " in head:                    # '<T as core::fmt::Debug>' -> core
+            head = head.split(" as ", 1)[1].strip()
+        return head or None
+    if name.startswith("_ZN"):                # legacy: _ZN4core3fmt... -> core
+        i = 3
+        j = i
+        while j < len(name) and name[j].isdigit():
+            j += 1
+        if j > i:
+            ln = int(name[i:j])
+            comp = name[j:j + ln]
+            return comp or None
+    return None                               # v0 (_R...) unresolved -> library
+
+
+def _as_dotnet_head(name):
+    """.NET namespace head, or None. NativeAOT encodes the '.' namespace
+    separator as '_' and the method separator as '__', so the top-level
+    namespace is the token before the first single underscore."""
+    if not name or name.startswith(_AS_DUMMY_PREFIX):
+        return None
+    if name.startswith(("S_P_CoreLib", "System_Private_CoreLib")):
+        return "system"
+    for sep in ("::", "."):
+        if sep in name:
+            return name.split(sep, 1)[0] or None
+    if "_" in name:
+        return name.split("_", 1)[0] or None
+    return name or None
+
+
+def _as_ns_head(name, tc):
+    if tc == "go":
+        return _as_go_pkg(name)
+    if tc == "rust":
+        return _as_rust_head(name)
+    if tc == "dotnet":
+        return _as_dotnet_head(name)
+    return None
+
+
+def _as_known_lib_ns(head, tc):
+    if head is None:
+        return False
+    h = head.lower()
+    if tc == "rust":
+        return h in _AS_RUST_STD
+    if tc == "dotnet":
+        return h in _AS_DOTNET_LIB
+    if tc == "go":
+        return h != "main"
+    return False
+
+
+def _as_author_ns():
+    """The set of namespace heads treated as author code for the current
+    toolchain. User-set value wins; otherwise auto-detected and cached."""
+    global _AS_AUTHOR_AUTO
+    if _AS_AUTHOR_PKGS is not None:
+        return _AS_AUTHOR_PKGS
+    tc = _as_toolchain()
+    if tc == "go":
+        return {"main"}
+    if tc not in ("rust", "dotnet"):
+        return set()
+    if _AS_AUTHOR_AUTO is not None:
+        return _AS_AUTHOR_AUTO
+    _AS_AUTHOR_AUTO = _as_detect_author_ns(tc)
+    return _AS_AUTHOR_AUTO
+
+
+def _as_detect_author_ns(tc):
+    """Best-effort: the namespace of the entry symbol (crate::main / *.Main)
+    that is not a known runtime namespace."""
+    found = set()
+    seen = 0
+    for fea in idautils.Functions():
+        nm = ida_funcs.get_func_name(fea) or ""
+        low = nm.lower()
+        is_entry = (low.endswith("::main") or low.endswith(".main")
+                    or low.endswith("__main") or "::main::" in low
+                    or low.endswith("_main") or "program__main" in low
+                    or low.endswith(".main()"))
+        if is_entry:
+            head = _as_ns_head(nm, tc)
+            if head and not _as_known_lib_ns(head, tc):
+                found.add(head.lower())
+        seen += 1
+        if seen > 6000:
+            break
+    return found
 
 
 def _as_func_kind(ea):
@@ -292,32 +465,60 @@ def _as_func_kind(ea):
     if flags & FUNC_LIB:
         return "lib"
     name = ida_funcs.get_func_name(f.start_ea) or ""
-    if _as_is_go():
-        pkg = _as_go_pkg(name)
-        if pkg is not None:
-            return "user" if pkg.lower() in _AS_AUTHOR_PKGS else "lib"
-        # no recognisable package (sub_, stub) - fall through to name check
+    tc = _as_toolchain()
+    if tc in ("go", "rust", "dotnet"):
+        head = _as_ns_head(name, tc)
+        if head is None:
+            # unnamed / stub: bias to library for namespaced toolchains so a
+            # runtime stub can never surface as author (except Go, where author
+            # code is always package-qualified and stubs are rare runtime asm).
+            return "user" if tc == "go" else "lib"
+        return "user" if head.lower() in _as_author_ns() else "lib"
     if _as_name_is_lib(name):
         return "lib"
     return "user"
 
 
 def set_author_packages(*names):
-    """Set the Go package head(s) treated as author code (default: main).
-    Example: set_author_packages('main', 'crackme')."""
-    global _AS_AUTHOR_PKGS
-    if names:
-        _AS_AUTHOR_PKGS = set(n.lower() for n in names)
-    _as_log("author packages: %s" % ", ".join(sorted(_AS_AUTHOR_PKGS)))
+    """Set the namespace head(s) treated as author code (Go package, Rust crate,
+    or .NET namespace). Example: set_author_packages('main'), or
+    set_author_packages('crackme') for a Rust crate. Call with no arguments to
+    return to auto-detection."""
+    global _AS_AUTHOR_PKGS, _AS_AUTHOR_AUTO
+    _AS_AUTHOR_AUTO = None
+    _AS_AUTHOR_PKGS = set(n.lower() for n in names) if names else None
+    _as_log("author namespaces: %s"
+            % (", ".join(sorted(_AS_AUTHOR_PKGS)) if _AS_AUTHOR_PKGS else "auto"))
     return _AS_AUTHOR_PKGS
 
 
+def set_toolchain(tc):
+    """Force the toolchain ('go'|'rust'|'dotnet'|'msvc'|'gnu'|'unknown'), or
+    None to re-enable auto-detection."""
+    global _AS_TC, _AS_AUTHOR_AUTO
+    _AS_TC = tc
+    _AS_AUTHOR_AUTO = None
+    _as_log("toolchain = %s" % (tc or "auto"))
+    return _AS_TC
+
+
 def set_go_mode(on):
-    """Force Go mode on/off (None re-enables auto-detection)."""
-    global _AS_GO_MODE
+    """Back-compat: force Go mode on/off (None re-enables auto-detection)."""
+    global _AS_GO_MODE, _AS_TC
     _AS_GO_MODE = on
+    _AS_TC = None
     _as_log("Go mode = %s" % ("auto" if on is None else on))
     return _AS_GO_MODE
+
+
+def toolchain():
+    """Report the detected toolchain and the author namespace(s) in use."""
+    tc = _as_toolchain()
+    auth = _as_author_ns()
+    _as_log("toolchain: %s   author namespace(s): %s"
+            % (tc, ", ".join(sorted(auth)) if auth else
+               "(none - set with set_author_packages)"))
+    return tc
 
 
 def _as_refs(ea):
@@ -365,26 +566,29 @@ def _as_seg(ea):
 # collection
 # ----------------------------------------------------------------------------
 def coverage():
-    """Report library-function coverage - how much to trust provenance."""
-    if _as_is_go():
-        total = author = lib = 0
+    """Report how confidently provenance can attribute code, per toolchain."""
+    tc = _as_toolchain()
+    if tc in ("go", "rust", "dotnet"):
+        authns = _as_author_ns()
+        total = author = lib = named = 0
         for fea in idautils.Functions():
             total += 1
-            pkg = _as_go_pkg(ida_funcs.get_func_name(fea) or "")
-            if pkg is None:
+            head = _as_ns_head(ida_funcs.get_func_name(fea) or "", tc)
+            if head is None:
                 continue
-            if pkg.lower() in _AS_AUTHOR_PKGS:
+            named += 1
+            if head.lower() in authns:
                 author += 1
             else:
                 lib += 1
-        _as_log("Go binary: %d function(s); %d in author package(s) {%s}, "
-                "%d in library/other packages, %d unnamed."
-                % (total, author, ", ".join(sorted(_AS_AUTHOR_PKGS)), lib,
-                   total - author - lib))
+        _as_log("%s binary: %d function(s), %d namespaced; %d in author {%s}, "
+                "%d in library/other."
+                % (tc, total, named, author,
+                   ", ".join(sorted(authns)) if authns else "-", lib))
         if author == 0:
-            _as_log("  no functions in the author package(s). If the author's "
-                    "code is not 'main', set it: set_author_packages('main', "
-                    "'<module_pkg>').")
+            _as_log("  no functions in the author namespace. Name it explicitly: "
+                    "set_author_packages('<crate_or_namespace>'); toolchain() "
+                    "and author_strings(show_all=True) help identify it.")
         return author, total
     total = libf = 0
     for fea in idautils.Functions():
@@ -394,12 +598,12 @@ def coverage():
                   _as_name_is_lib(ida_funcs.get_func_name(fea) or "")):
             libf += 1
     pct = (100.0 * libf / total) if total else 0.0
-    _as_log("FLIRT/library coverage: %d of %d function(s) marked library (%.1f%%)"
-            % (libf, total, pct))
+    _as_log("toolchain=%s. FLIRT/library coverage: %d of %d function(s) marked "
+            "library (%.1f%%)" % (tc, libf, total, pct))
     if libf == 0:
         _as_log("  no library functions recognised - apply signatures for best "
                 "precision (the content backstop still filters classic runtime "
-                "strings). Options > ... or let auto-analysis finish.")
+                "strings). Let auto-analysis finish, or add signatures.")
     return libf, total
 
 
@@ -590,9 +794,10 @@ def _as_bootstrap():
     except Exception as exc:
         _as_log("could not bind hotkey: %s" % exc)
     _as_log("ready. author_strings() lists the author's strings (Ctrl-Alt-A); "
-            "author_strings(show_all=True) audits every verdict; find(sub) "
-            "searches; explain(ea) shows the reasoning; coverage() reports "
-            "trust. Go binaries: author = package 'main' (set_author_packages).")
+            "show_all=True audits every verdict; find(sub) searches; explain(ea) "
+            "shows the reasoning; toolchain()/coverage() report detection. "
+            "Handles C/C++, Go, Rust, .NET AOT; set_author_packages('<name>') "
+            "if the author crate/namespace is not auto-found.")
 
 
 _as_bootstrap()
