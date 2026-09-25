@@ -18,6 +18,8 @@ IDA_PRO_SCRIPTS/
 │   └── pe_dumper.py                 # carve a full PE out of memory -> .exe/.dll/.sys
 ├── navigation/
 │   └── function_conditions.py       # map every condition in the current function
+├── flow/
+│   └── trace_to_main.py             # follow trampoline/tail-call chains to the real code
 ├── scanning/
 │   └── segment_scanner.py           # hunt PE/code/magic signatures in chosen segments
 ├── integrity/
