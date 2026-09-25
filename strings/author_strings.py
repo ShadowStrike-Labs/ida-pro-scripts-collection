@@ -24,6 +24,13 @@
 #
 #  Verdicts: AUTHOR, ARTIFACT (shown by default), LIBRARY, UNREF, NOISE.
 #
+#  Go binaries
+#    Go recovers package-qualified names (runtime.*, fmt.*, os.*, internal/*).
+#    These are auto-detected; the author's code is package `main`, so anything
+#    referenced only from other packages (the runtime, the stdlib, vendored
+#    deps) is library. If a target splits its logic into its own module
+#    packages, add them with set_author_packages('main', '<pkg>').
+#
 #  Console interface
 #    author_strings(show_all=False)   scan and open a jump-list of author (and
 #                                      artifact) strings; show_all lists every
@@ -46,6 +53,7 @@ import re
 import ida_bytes
 import ida_funcs
 import ida_kernwin
+import ida_segment
 import idautils
 import idc
 import idaapi
@@ -54,6 +62,19 @@ _AS_TAG = "[authstr]"
 
 FUNC_LIB = getattr(idaapi, "FUNC_LIB", 0x00000004)
 FUNC_THUNK = getattr(idaapi, "FUNC_THUNK", 0x00000080)
+
+# ---- Go support -----------------------------------------------------------
+#  Go binaries recover full package-qualified names from the pclntab
+#  (runtime.*, fmt.*, os.*, internal/cpu.*, ...). None of those match the MSVC
+#  library patterns, so provenance needs a Go arm: the author's code lives in
+#  package `main`; every other package (runtime, the STL-equivalent stdlib, and
+#  vendored third-party deps) is not the author's. _AS_AUTHOR_PKGS is the set of
+#  package heads treated as author (extend it with set_author_packages() when a
+#  crackme splits logic into its own module packages).
+_AS_AUTHOR_PKGS = {"main"}
+_AS_GO_MODE = None                       # None = auto-detect, or True/False
+_AS_DUMMY_PREFIX = ("sub_", "loc_", "unk_", "nullsub_", "j_", "def_",
+                    "__imp_", "unknown_libname", "byte_", "off_", "qword_")
 
 # verdict -> (label, BGR line colour, shown-by-default)
 _AS_META = {
@@ -219,6 +240,47 @@ def _as_func_name(ea):
     return ida_funcs.get_func_name(f.start_ea)
 
 
+def _as_is_go():
+    """Detect a Go binary (cached). Set explicitly with set_go_mode()."""
+    global _AS_GO_MODE
+    if _AS_GO_MODE is not None:
+        return _AS_GO_MODE
+    go = False
+    for sname in (".gopclntab", ".go.buildinfo", ".noptrdata", ".typelink",
+                  ".itablink"):
+        try:
+            if ida_segment.get_segm_by_name(sname):
+                go = True
+                break
+        except Exception:
+            pass
+    if not go:
+        seen = 0
+        for fea in idautils.Functions():
+            nm = ida_funcs.get_func_name(fea) or ""
+            if nm.startswith(("runtime.", "runtime_")):
+                go = True
+                break
+            seen += 1
+            if seen > 3000:
+                break
+    _AS_GO_MODE = go
+    return go
+
+
+def _as_go_pkg(name):
+    """Extract the Go package head from an (IDA-sanitised) symbol, or None.
+    'runtime.mallocgc' -> 'runtime'; 'fmt._ptr_pp.doPrintf' -> 'fmt';
+    'internal_cpu.doinit' -> 'internal_cpu'; 'main._ptr_T.m' -> 'main'.
+    IDA dummy names (sub_, loc_, ...) return None so they are not mistaken
+    for a package."""
+    if not name or name.startswith(_AS_DUMMY_PREFIX):
+        return None
+    head = name.split(".", 1)[0] if "." in name else name.split("_", 1)[0]
+    head = head.split("_ptr_", 1)[0]
+    return head or None
+
+
 def _as_func_kind(ea):
     """Classify the function containing `ea`: 'user' | 'lib' | 'thunk' | None."""
     f = ida_funcs.get_func(ea)
@@ -229,9 +291,33 @@ def _as_func_kind(ea):
         return "thunk"
     if flags & FUNC_LIB:
         return "lib"
-    if _as_name_is_lib(ida_funcs.get_func_name(f.start_ea) or ""):
+    name = ida_funcs.get_func_name(f.start_ea) or ""
+    if _as_is_go():
+        pkg = _as_go_pkg(name)
+        if pkg is not None:
+            return "user" if pkg.lower() in _AS_AUTHOR_PKGS else "lib"
+        # no recognisable package (sub_, stub) - fall through to name check
+    if _as_name_is_lib(name):
         return "lib"
     return "user"
+
+
+def set_author_packages(*names):
+    """Set the Go package head(s) treated as author code (default: main).
+    Example: set_author_packages('main', 'crackme')."""
+    global _AS_AUTHOR_PKGS
+    if names:
+        _AS_AUTHOR_PKGS = set(n.lower() for n in names)
+    _as_log("author packages: %s" % ", ".join(sorted(_AS_AUTHOR_PKGS)))
+    return _AS_AUTHOR_PKGS
+
+
+def set_go_mode(on):
+    """Force Go mode on/off (None re-enables auto-detection)."""
+    global _AS_GO_MODE
+    _AS_GO_MODE = on
+    _as_log("Go mode = %s" % ("auto" if on is None else on))
+    return _AS_GO_MODE
 
 
 def _as_refs(ea):
@@ -279,7 +365,27 @@ def _as_seg(ea):
 # collection
 # ----------------------------------------------------------------------------
 def coverage():
-    """Report FLIRT library-function coverage - how much to trust provenance."""
+    """Report library-function coverage - how much to trust provenance."""
+    if _as_is_go():
+        total = author = lib = 0
+        for fea in idautils.Functions():
+            total += 1
+            pkg = _as_go_pkg(ida_funcs.get_func_name(fea) or "")
+            if pkg is None:
+                continue
+            if pkg.lower() in _AS_AUTHOR_PKGS:
+                author += 1
+            else:
+                lib += 1
+        _as_log("Go binary: %d function(s); %d in author package(s) {%s}, "
+                "%d in library/other packages, %d unnamed."
+                % (total, author, ", ".join(sorted(_AS_AUTHOR_PKGS)), lib,
+                   total - author - lib))
+        if author == 0:
+            _as_log("  no functions in the author package(s). If the author's "
+                    "code is not 'main', set it: set_author_packages('main', "
+                    "'<module_pkg>').")
+        return author, total
     total = libf = 0
     for fea in idautils.Functions():
         total += 1
@@ -486,7 +592,7 @@ def _as_bootstrap():
     _as_log("ready. author_strings() lists the author's strings (Ctrl-Alt-A); "
             "author_strings(show_all=True) audits every verdict; find(sub) "
             "searches; explain(ea) shows the reasoning; coverage() reports "
-            "FLIRT trust.")
+            "trust. Go binaries: author = package 'main' (set_author_packages).")
 
 
 _as_bootstrap()
