@@ -29,8 +29,11 @@
 #  Console interface
 #    find_main()                 trace from the entry point to the real code,
 #                                jump there, and report the path
-#    trace_chain(start=None)     trace from `start` (default: cursor); jump to
-#                                the terminus
+#    trace_jmps(start=None)      follow an instruction-level jump maze
+#                                (jmp -> jmp -> ..., e.g. a `jmp $-5` staircase)
+#                                to the first non-jump instruction
+#    trace_chain(start=None)     follow a chain of trampoline FUNCTIONS (each
+#                                does some work, then tail-jumps to the next)
 #    diagnose(ea=None)           explain the transfers + follow decision at one
 #                                function (run it where a trace stops early)
 #    chain_list()                reprint the last traced chain
@@ -46,6 +49,7 @@
 import re
 import warnings
 
+import ida_bytes
 import ida_funcs
 import ida_ua
 import ida_kernwin
@@ -84,6 +88,11 @@ def _ch_get_func(ea):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return ida_funcs.get_func(ea)
+
+
+def _ch_read(ea, n):
+    b = ida_bytes.get_bytes(ea, n)
+    return bytes(b) if b else b""
 
 
 def _ch_name_is_lib(name):
@@ -198,6 +207,60 @@ def _ch_walk(start, get_succ, max_hops=1000000, on_step=None):
         seen.add(nxt)
         cur = nxt
     return chain, "max_hops"
+
+
+def _ch_jmp_target(b, ea):
+    """If `b` (bytes at `ea`) begins with a direct unconditional jump or a
+    `push imm32; ret` trampoline, return (target, size). For an indirect jump
+    (`jmp reg` / `jmp [mem]`) return ('indirect', size). Otherwise None. This is
+    the primitive for following an instruction-level jmp maze (jmp -> jmp -> ...
+    across function boundaries), which IDA hides inside a single function."""
+    if not b:
+        return None
+    i = 0
+    while i < 4 and i < len(b) and b[i] in (0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65,
+                                            0x66, 0x67, 0x40, 0x41, 0x48, 0x49):
+        i += 1                                         # skip seg/REX prefixes
+    op = b[i] if i < len(b) else None
+    if op == 0xE9 and i + 5 <= len(b):                 # jmp rel32
+        rel = int.from_bytes(b[i + 1:i + 5], "little", signed=True)
+        return (ea + i + 5 + rel, i + 5)
+    if op == 0xEB and i + 2 <= len(b):                 # jmp rel8
+        rel = int.from_bytes(b[i + 1:i + 2], "little", signed=True)
+        return (ea + i + 2 + rel, i + 2)
+    if op == 0xFF and i + 2 <= len(b) and ((b[i + 1] >> 3) & 7) == 4:
+        return ("indirect", i + 2)                     # jmp r/m
+    if op == 0x68 and i + 6 <= len(b) and b[i + 5] == 0xC3:   # push imm32; ret
+        return (int.from_bytes(b[i + 1:i + 5], "little", signed=True)
+                & 0xFFFFFFFFFFFFFFFF, i + 6)
+    return None
+
+
+def _ch_follow_jmps(start, read, max_hops=2000000, on_step=None):
+    """Follow a chain of direct unconditional jumps at the instruction level.
+    read(ea, n)->bytes. Returns (landing, hops, reason) with reason in
+    {'landing','indirect','loop','max_hops','cancelled','unreadable'};
+    'landing' is the first non-jump instruction (the real code)."""
+    cur = start
+    hops = 0
+    seen = set()
+    while hops < max_hops:
+        if on_step is not None and on_step(hops, cur) is False:
+            return cur, hops, "cancelled"
+        if cur in seen:
+            return cur, hops, "loop"
+        seen.add(cur)
+        b = read(cur, 16)
+        if not b:
+            return cur, hops, "unreadable"
+        r = _ch_jmp_target(b, cur)
+        if r is None:
+            return cur, hops, "landing"
+        if r[0] == "indirect":
+            return cur, hops, "indirect"
+        cur = r[0]
+        hops += 1
+    return cur, hops, "max_hops"
 
 
 def _ch_is_main_name(name):
@@ -459,25 +522,109 @@ def diagnose(ea=None):
     return None
 
 
-def find_main(follow_calls=True, max_hops=1000000, rename=False):
-    """Trace from the program entry point to the real code."""
+def _ch_seg(ea):
+    try:
+        return idc.get_segm_name(ea) or "?"
+    except Exception:
+        return "?"
+
+
+def _ch_real_after_padding(ea):
+    """If `ea` is int3/nop alignment padding, return the first instruction after
+    it, else ea. (ud2 is NOT treated as padding - it is a deliberate trap.)"""
+    cur = ea
+    for _ in range(64):
+        b = _ch_read(cur, 1)
+        if not b:
+            return ea
+        if b[0] in (0xCC, 0x90):                       # int3 / nop
+            cur += 1
+            continue
+        return cur
+    return ea
+
+
+def trace_jmps(start=None, max_hops=2000000):
+    """Follow an instruction-level jump maze (jmp -> jmp -> ... across function
+    boundaries, the kind IDA lumps into one function) from `start` to the first
+    non-jump instruction, and jump there. This is the mode for `jmp $-5`
+    staircases / trampoline mazes."""
+    global _ch_last_chain, _ch_last_reason
+    ea = _ch_addr(start) if start is not None else idc.get_screen_ea()
+    if ea is None or ea == BADADDR:
+        _ch_log("no start address")
+        return None
+
+    def _step(i, cur):
+        if i and i % 20000 == 0:
+            if ida_kernwin.user_cancelled():
+                return False
+            ida_kernwin.replace_wait_box("trace2main: %d jmp hops..." % i)
+        return True
+
+    ida_kernwin.show_wait_box("trace2main: following jump maze (Cancel to stop)")
+    try:
+        landing, hops, reason = _ch_follow_jmps(ea, _ch_read, max_hops, _step)
+    finally:
+        ida_kernwin.hide_wait_box()
+
+    _ch_last_chain = [ea, landing]
+    _ch_last_reason = reason
+    _ch_log("followed %d direct jump(s) from %012X -> %012X (%s)"
+            % (hops, ea, landing, _ch_seg(landing)))
+    if reason == "indirect":
+        _ch_log("landing is an INDIRECT jump (jmp reg / jmp [mem]) - the one "
+                "spot to breakpoint; its runtime target is the next stage.")
+    elif reason == "loop":
+        _ch_log("the jump chain loops (dispatcher / opaque cycle).")
+    elif reason == "max_hops":
+        _ch_log("hit the hop cap (%d); raise max_hops if needed." % max_hops)
+    elif reason == "unreadable":
+        _ch_log("landed on unreadable bytes at %012X." % landing)
+    else:
+        b = _ch_read(landing, 2)
+        if b and len(b) >= 2 and b[0] == 0x0F and b[1] == 0x0B:
+            _ch_log("landing is UD2 - a deliberate #UD trap. This binary likely "
+                    "drives control flow through an exception/VEH handler: the "
+                    "real next stage is chosen at runtime by the handler, not by "
+                    "a static jump. Breakpoint here and inspect the vectored/SEH "
+                    "handler (see debugging/pass_exceptions.py).")
+        else:
+            real = _ch_real_after_padding(landing)
+            if real != landing:
+                _ch_log("landing is int3/nop padding; real code begins at %012X."
+                        % real)
+                landing = real
+            idc.set_cmt(landing, "trace2main: jump-maze landing (%d hops)" % hops, 0)
+    ida_kernwin.jumpto(landing)
+    _ch_log("cursor moved to %012X." % landing)
+    return landing
+
+
+def find_main(follow_calls=True, max_hops=2000000, rename=False):
+    """Trace from the program entry point to the real code. Tries the
+    instruction-level jump maze first (handles `jmp $-5` staircases), then falls
+    back to following a chain of trampoline functions."""
     ea = _ch_entry()
     if ea is None:
         _ch_log("could not locate the entry point; use trace_chain(start).")
         return None
     _ch_log("entry point: %012X (%s)" % (ea, _ch_func_name(ea)))
+    # instruction-level jump maze first
+    landing, hops, reason = _ch_follow_jmps(ea, _ch_read, max_hops)
+    if hops >= 2 or reason in ("indirect",):
+        return trace_jmps(ea, max_hops)
+    # otherwise follow trampoline functions
     terminus = trace_chain(ea, follow_calls, max_hops, rename)
     if terminus is None:
         return None
-    # highlight the best main candidate anywhere along the path
     named = [e for e in _ch_last_chain if _ch_is_main_name(_ch_func_name(e))]
     io = [e for e in _ch_last_chain if _ch_reads_input(e)]
     if named:
         _ch_log("main-like name on the path: %s @ %012X"
                 % (_ch_func_name(named[-1]), named[-1]))
     if io:
-        _ch_log("input is read at: %s @ %012X"
-                % (_ch_func_name(io[0]), io[0]))
+        _ch_log("input is read at: %s @ %012X" % (_ch_func_name(io[0]), io[0]))
     if not named and not io:
         _ch_log("no name/I/O anchor matched; the terminus above is the real "
                 "code the chain led to.")
@@ -514,10 +661,10 @@ def _ch_bootstrap():
         _ch_hotkey = ida_kernwin.add_hotkey("Ctrl-Alt-M", find_main)
     except Exception as exc:
         _ch_log("could not bind hotkey: %s" % exc)
-    _ch_log("ready. find_main() traces the entry point through the trampoline "
-            "chain to the real code (Ctrl-Alt-M); trace_chain(start) traces from "
-            "anywhere; diagnose(ea) explains why a trace stops; chain_list() "
-            "reprints; goto_terminus() jumps to the end.")
+    _ch_log("ready. find_main() (Ctrl-Alt-M) auto-follows a jump maze or a "
+            "trampoline-function chain from the entry point to the real code; "
+            "trace_jmps(start) follows a jmp->jmp maze; trace_chain(start) "
+            "follows trampoline functions; diagnose(ea) explains a stop.")
 
 
 _ch_bootstrap()
