@@ -30,7 +30,9 @@ IDA_PRO_SCRIPTS/
 │   └── author_strings.py            # isolate author-written strings from library noise
 ├── debugging/
 │   ├── auto_tailjump.py             # peel packer/VM layers + instrument handlers
-│   └── pass_exceptions.py           # pass all debugger exceptions to the app
+│   ├── pass_exceptions.py           # pass all debugger exceptions to the app
+│   ├── hide_debugger.py             # patch PEB/heap debugger flags in memory
+│   └── rdtsc_emulator.py            # emulate rdtsc/rdtscp to defeat timing checks
 ├── loaders/
 │   └── dll_loader_stub_generator.py # build a minimal EXE that loads a DLL with LoadLibrary
 ├── notes/
@@ -63,6 +65,7 @@ Pull requests are welcome.
 ## Requirements
 
 * IDA Pro 7.x / 8.x / 9.x with IDAPython 3.
-* The debugger-oriented scripts (`auto_tailjump.py`, `pass_exceptions.py`) need
-  an active debugging session; the rest work statically.
+* The debugger-oriented scripts (`auto_tailjump.py`, `pass_exceptions.py`,
+  `hide_debugger.py`, `rdtsc_emulator.py`) need an active debugging session;
+  the rest work statically.
 
