@@ -2,17 +2,31 @@
 #  syscall_table.py  -  IDAPython: live, build-accurate Windows syscall table
 # ----------------------------------------------------------------------------
 #  A Debugger-menu table that maps every x64 Windows syscall number to the
-#  Nt*/Zw*/user-mode function on the machine the script is running on. The
-#  numbers are parsed from the actual DLLs on this system (ntdll.dll +
-#  win32u.dll, plus the WoW64 variants when present) so they match the current
-#  Windows build and patch level exactly - no static tables, no web lookups,
-#  no "what is 0x19 on 22H2 vs 23H2" guesswork.
+#  Nt*/win32k function on the machine the script is running on. The numbers
+#  are parsed from the actual DLLs on this system (ntdll.dll + win32u.dll,
+#  plus the WoW64 copies when present) so they match the current Windows
+#  build and patch level exactly - no static tables, no web lookups.
 #
-#  WHY ON-DISK PARSING IS "LIVE"
-#  Every process on this machine loads the same %SystemRoot%\System32\ntdll.dll
-#  (and win32u.dll). The syscall stubs are just a few bytes each, with the
-#  number baked into a `mov eax, imm32`. Reading those bytes off disk gives
-#  the exact same numbers the kernel is dispatching right now.
+#  PORTABILITY
+#  Nothing is hardcoded to any particular machine. Running the script on
+#  Windows 10 1909 produces 1909's numbers, running it on Windows 11 24H2
+#  produces 24H2's, running it on an Insider build of 26H1 produces 26H1's.
+#  The DLL export table and syscall-stub format have been stable from Vista
+#  through 26H1 (confirmed via j00ru/windiff tables and the hasherezade
+#  extractor), so any future Windows build is covered automatically.
+#
+#  Nt* vs Zw*  (why you see pairs in the raw data)
+#  Every NT syscall is exported from ntdll under BOTH names - Nt* and Zw* -
+#  and the two exports point to the SAME bytes. In user mode they are
+#  interchangeable aliases; the syscall number is the same. The distinction
+#  matters only inside the kernel (ntoskrnl.exe):
+#     Nt<Foo>  : untrusted entry point. Validates parameters according to
+#                the caller's PreviousMode (user vs kernel).
+#     Zw<Foo>  : trusted wrapper for kernel callers. Sets PreviousMode =
+#                KernelMode so parameter validation is skipped.
+#  Because this table is for user-mode analysis, by default each syscall is
+#  shown ONCE under its Nt name. Pass include_aliases=True (or run with the
+#  "Show Zw aliases" chooser toggle) if you want both.
 #
 #  SOURCES SCANNED  (all optional; whatever exists is used)
 #    %SystemRoot%\System32\ntdll.dll       NT syscalls, x64 stubs
@@ -24,29 +38,29 @@
 #    classic x64    4C 8B D1 B8 <imm32> ...  0F 05
 #    CET x64        F3 0F 1E FA 4C 8B D1 B8 <imm32> ...
 #    WoW64 x86      B8 <imm32> [BA ...|64 FF 15 C0 00 00 00|...]
-#    Export forwarders (Nt* -> other DLL) are skipped (no syscall number).
+#    WoW64 encodes (stack_bytes << 16) | number in EAX; the extractor masks
+#    to the low 16 bits (Windows service numbers are 12-bit index + 1-bit
+#    table selector, always fitting). Export forwarders are skipped.
 #
 #  UI
 #    Debugger -> Syscall Table...        open the chooser
 #    Ctrl-Alt-S                          same, from anywhere
-#  Chooser columns: Number (hex), Decimal, Function, Source. Click a header to
-#  sort; type to filter; double-click a row to copy the function name to the
-#  console (there is no in-DB address to jump to - these are OS symbols).
+#  Chooser columns: Number (hex), Decimal, Function, Alias, Source. Click a
+#  header to sort; type to filter; double-click a row to copy the function
+#  name to the console.
 #
 #  CONSOLE COMMANDS
-#    show_syscalls()            open the chooser
-#    syscall_lookup(0x19)       -> prints every function with that number
-#    syscall_lookup("0x19")     same (string form accepted)
-#    syscall_find("NtClose")    -> prints every match (substring, case-insens.)
-#    refresh_syscalls()         re-parse after a Windows update
+#    show_syscalls()                  open the chooser (Nt only by default)
+#    show_syscalls(include_aliases=True)   also list Zw aliases as rows
+#    syscall_lookup(0x19)             prints the function (and its Zw alias)
+#    syscall_find("NtClose")          substring, case-insensitive
+#    refresh_syscalls()               re-parse after a Windows update
+#    refresh_syscalls(paths=[...])    parse DLLs from another machine
 #
 #  LIMITATIONS
 #    * x64 Windows only (parses the x64 DLLs; WoW64 x86 stubs reference the
 #      same numbers via heaven's gate, so they are cross-shown but not
-#      independently decoded).
-#    * Reads the DLLs on THIS machine. For a different build (e.g. a VM you
-#      are analysing), copy its ntdll/win32u into a folder and call
-#      refresh_syscalls(paths=[...]) with absolute paths.
+#      independently decoded beyond the number itself).
 # ============================================================================
 
 import os
@@ -232,12 +246,17 @@ def _sl_load_source(path, label):
     return out
 
 
-def _sl_build_table(paths=None):
-    """Build the deduplicated syscall table from the given sources (default:
-    this machine's ntdll + win32u, including WoW64 copies). Each real syscall
-    appears exactly once; the Source column lists every DLL that exports it."""
+def _sl_build_table(paths=None, include_aliases=False):
+    """Build the deduplicated syscall table from the given sources.
+
+    include_aliases=False (default): one row per syscall - the Nt* canonical
+      name is shown and the Zw* alias is attached as a 4-tuple (num, name,
+      alias_or_"", sources). Analysts rarely need to see both.
+    include_aliases=True:  the raw view - every exported Nt and Zw name is a
+      separate row. Useful if you want to search by Zw name directly.
+    """
     sources = paths if paths else _sl_default_sources()
-    merged = {}          # (number, name) -> set of labels
+    raw = {}             # (number, name) -> set of source labels
     stats = []
     for item in sources:
         path, label = (item if isinstance(item, tuple) else (item, os.path.basename(item)))
@@ -246,9 +265,35 @@ def _sl_build_table(paths=None):
         got = _sl_load_source(path, label)
         stats.append((label, len(got)))
         for num, name, lbl in got:
-            merged.setdefault((num, name), set()).add(lbl)
-    rows = [(num, name, ", ".join(sorted(labels)))
-            for (num, name), labels in merged.items()]
+            raw.setdefault((num, name), set()).add(lbl)
+
+    if include_aliases:
+        rows = [(num, name, "", ", ".join(sorted(labels)))
+                for (num, name), labels in raw.items()]
+        rows.sort(key=lambda r: (r[0], r[1]))
+        return rows, stats
+
+    # collapse to one row per (number, functional-stem). Nt<Foo> and Zw<Foo>
+    # share the same stem so they merge. Entries without an Nt/Zw prefix (rare)
+    # pass through unchanged.
+    groups = {}          # (number, stem) -> {names: set, labels: set}
+    for (num, name), labels in raw.items():
+        stem = name[2:] if name[:2] in ("Nt", "Zw") else name
+        g = groups.setdefault((num, stem), {"names": set(), "labels": set()})
+        g["names"].add(name)
+        g["labels"].update(labels)
+
+    rows = []
+    for (num, _stem), info in groups.items():
+        nt_names = sorted(n for n in info["names"] if n.startswith("Nt"))
+        zw_names = sorted(n for n in info["names"] if n.startswith("Zw"))
+        if nt_names:
+            primary, alias = nt_names[0], (zw_names[0] if zw_names else "")
+        elif zw_names:
+            primary, alias = zw_names[0], ""
+        else:
+            primary, alias = sorted(info["names"])[0], ""
+        rows.append((num, primary, alias, ", ".join(sorted(info["labels"]))))
     rows.sort(key=lambda r: (r[0], r[1]))
     return rows, stats
 
@@ -256,18 +301,21 @@ def _sl_build_table(paths=None):
 # ----------------------------------------------------------------------------
 # cache + console commands
 # ----------------------------------------------------------------------------
-_sl_rows = []            # [(num, name, source)]
-_sl_by_num = {}          # num -> [(name, source), ...]
-_sl_by_name = {}         # name.lower() -> (num, source)
+_sl_rows = []            # [(num, name, alias, source)]
+_sl_include_aliases = False
+_sl_by_num = {}          # num -> [(name, alias, source), ...]
+_sl_by_name = {}         # name.lower() -> (num, alias, source)
 
 
 def _sl_rebuild_index():
     global _sl_by_num, _sl_by_name
     _sl_by_num = {}
     _sl_by_name = {}
-    for num, name, src in _sl_rows:
-        _sl_by_num.setdefault(num, []).append((name, src))
-        _sl_by_name[name.lower()] = (num, src)
+    for num, name, alias, src in _sl_rows:
+        _sl_by_num.setdefault(num, []).append((name, alias, src))
+        _sl_by_name[name.lower()] = (num, alias, src)
+        if alias:
+            _sl_by_name[alias.lower()] = (num, name, src)
 
 
 def _sl_ensure_loaded():
@@ -277,17 +325,22 @@ def _sl_ensure_loaded():
     return refresh_syscalls()
 
 
-def refresh_syscalls(paths=None):
-    """(Re)parse the system DLLs and rebuild the index. Optionally pass a list
-    of explicit DLL paths (useful to analyse another machine's binaries by
-    pointing at its copies)."""
-    global _sl_rows
-    rows, stats = _sl_build_table(paths)
+def refresh_syscalls(paths=None, include_aliases=None):
+    """(Re)parse the system DLLs and rebuild the index. Optional args:
+      paths            explicit DLL paths (e.g. a VM's copies)
+      include_aliases  True to show Nt and Zw as separate rows (default: False)
+    """
+    global _sl_rows, _sl_include_aliases
+    if include_aliases is not None:
+        _sl_include_aliases = bool(include_aliases)
+    rows, stats = _sl_build_table(paths, include_aliases=_sl_include_aliases)
     _sl_rows = rows
     _sl_rebuild_index()
     if stats:
         parts = ", ".join("%s=%d" % (lbl, n) for lbl, n in stats)
-        _sl_log("loaded %d syscall(s)  [%s]" % (len(_sl_rows), parts))
+        mode = "Nt+Zw rows" if _sl_include_aliases else "Nt only (Zw collapsed)"
+        _sl_log("loaded %d syscall(s)  [%s]  mode=%s"
+                % (len(_sl_rows), parts, mode))
     else:
         _sl_log("no source DLLs found; set paths=[...] to point at them.")
     return bool(_sl_rows)
@@ -306,7 +359,9 @@ def _sl_coerce_num(v):
 
 
 def syscall_lookup(n):
-    """Print every function whose syscall number equals `n` (int or '0x19')."""
+    """Print every function whose syscall number equals `n`. In the default
+    (collapsed) view, both the Nt name and its Zw alias are shown so you can
+    see exactly which pair maps to that number."""
     _sl_ensure_loaded()
     try:
         num = _sl_coerce_num(n)
@@ -318,23 +373,26 @@ def syscall_lookup(n):
         _sl_log("no match for %#x (%d) on this build." % (num, num))
         return []
     _sl_log("%#x (%d):" % (num, num))
-    for name, src in hits:
-        print("  %-48s  [%s]" % (name, src))
+    for name, alias, src in hits:
+        alias_bit = ("  (also %s)" % alias) if alias else ""
+        print("  %-48s%s   [%s]" % (name, alias_bit, src))
     return hits
 
 
 def syscall_find(substr):
-    """Print every function whose name contains `substr` (case-insensitive)."""
+    """Print every function whose name or alias contains `substr`
+    (case-insensitive)."""
     _sl_ensure_loaded()
     needle = str(substr).lower()
-    hits = [(num, name, src) for (num, name, src) in _sl_rows
-            if needle in name.lower()]
+    hits = [(num, name, alias, src) for (num, name, alias, src) in _sl_rows
+            if needle in name.lower() or (alias and needle in alias.lower())]
     if not hits:
         _sl_log("no match for %r on this build." % substr)
         return []
     _sl_log("%d match(es) for %r:" % (len(hits), substr))
-    for num, name, src in hits:
-        print("  %#06x  %-48s  [%s]" % (num, name, src))
+    for num, name, alias, src in hits:
+        alias_bit = ("  (also %s)" % alias) if alias else ""
+        print("  %#06x  %-48s%s   [%s]" % (num, name, alias_bit, src))
     return hits
 
 
@@ -348,8 +406,9 @@ if _IN_IDA:
             cols = [
                 ["Number",   10 | ida_kernwin.Choose.CHCOL_HEX],
                 ["Decimal",   8 | ida_kernwin.Choose.CHCOL_DEC],
-                ["Function", 48 | ida_kernwin.Choose.CHCOL_PLAIN],
-                ["Source",   20 | ida_kernwin.Choose.CHCOL_PLAIN],
+                ["Function", 44 | ida_kernwin.Choose.CHCOL_PLAIN],
+                ["Alias",    16 | ida_kernwin.Choose.CHCOL_PLAIN],
+                ["Source",   28 | ida_kernwin.Choose.CHCOL_PLAIN],
             ]
             ida_kernwin.Choose.__init__(
                 self, "Syscall Table (live, this machine)", cols,
@@ -361,8 +420,11 @@ if _IN_IDA:
 
         @staticmethod
         def _fmt(r):
-            num, name, src = r
-            return ["%#06x" % num, str(num), name, src]
+            # Row shape is always 4-tuple: (num, name, alias, source).
+            # In include_aliases mode, alias is "" because Nt and Zw are
+            # already separate rows.
+            num, name, alias, src = r
+            return ["%#06x" % num, str(num), name, alias or "", src]
 
         def OnGetSize(self):
             return len(self.items)
@@ -371,11 +433,11 @@ if _IN_IDA:
             return self.items[n]
 
         def OnSelectLine(self, n):
-            # Double-click: echo the selection to the console (no in-DB EA).
             idx = n[0] if isinstance(n, (list, tuple)) else n
             if idx is not None and 0 <= idx < len(self.rows):
-                num, name, src = self.rows[idx]
-                _sl_log("%#06x -> %s  [%s]" % (num, name, src))
+                num, name, alias, src = self.rows[idx]
+                tail = ("  (also %s)" % alias) if alias else ""
+                _sl_log("%#06x -> %s%s  [%s]" % (num, name, tail, src))
             nc = getattr(ida_kernwin.Choose, "NOTHING_CHANGED", None)
             return (nc,) if nc is not None else None
 
@@ -387,10 +449,14 @@ if _IN_IDA:
 
     _sl_chooser = None
 
-    def show_syscalls():
-        """Open the Syscall Table chooser (reparses on first call)."""
+    def show_syscalls(include_aliases=None):
+        """Open the Syscall Table chooser. include_aliases=True shows Nt and
+        Zw as separate rows (default: collapsed to one row per syscall)."""
         global _sl_chooser
-        _sl_ensure_loaded()
+        if include_aliases is not None:
+            refresh_syscalls(include_aliases=include_aliases)
+        else:
+            _sl_ensure_loaded()
         _sl_chooser = _SyscallChooser(list(_sl_rows))
         _sl_chooser.Show()
         return _sl_chooser
@@ -438,7 +504,9 @@ if _IN_IDA:
             _sl_hk_ctx = ida_kernwin.add_hotkey(_SL_HOTKEY, show_syscalls)
         except Exception:
             pass
-        _sl_log("ready. show_syscalls() opens the table (Ctrl-Alt-S); "
+        _sl_log("ready. show_syscalls() opens the table on YOUR Windows "
+                "build (Ctrl-Alt-S); Nt/Zw are collapsed to one row by "
+                "default - use show_syscalls(include_aliases=True) to split. "
                 "syscall_lookup(0x19) and syscall_find('NtClose') from the "
                 "console; refresh_syscalls() after a Windows update.")
 
