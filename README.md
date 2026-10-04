@@ -35,6 +35,8 @@ IDA_PRO_SCRIPTS/
 │   └── rdtsc_emulator.py            # emulate rdtsc/rdtscp to defeat timing checks
 ├── loaders/
 │   └── dll_loader_stub_generator.py # build a minimal EXE that loads a DLL with LoadLibrary
+├── syscalls/
+│   └── syscall_table.py             # live Windows syscall table parsed from this machine's ntdll
 ├── notes/
 │   └── vm_handlers.txt              # analysis notes / scratch data
 └── logs/                            # runtime logs (gitignored)
