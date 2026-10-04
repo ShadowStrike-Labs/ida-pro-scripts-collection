@@ -6,16 +6,34 @@ dll_loader_stub_generator.py
 IDAPython utility that generates a minimal, dependency-free 64-bit loader
 executable for the DLL that is currently open in IDA.
 
-The generated stub does exactly two things:
+The generated stub does up to three things:
 
-    1. Call ``LoadLibraryW`` on the absolute path of the target DLL.
-    2. Block indefinitely with ``Sleep(INFINITE)`` so the process stays alive
+    1. Call ``LoadLibraryExW`` on the absolute path of the target DLL.
+    2. Optionally break (``int3``) right after the load so the debugger stops
+       with the DLL mapped at a known base.
+    3. Block indefinitely with ``Sleep(INFINITE)`` so the process stays alive
        and the DLL remains mapped for inspection.
 
+Two load modes (see ``generate_loader_for_current_dll``):
+
+    * run_dllmain=True  (default) - normal load; the loader runs the DLL's
+      DllMain and TLS callbacks. Use this for self-unpacking samples whose OEP
+      is reached through DllMain.
+    * run_dllmain=False           - LoadLibraryExW with
+      DONT_RESOLVE_DLL_REFERENCES: the DLL is mapped but DllMain is NOT called
+      and imports are NOT resolved. Use this when a normal load HANGS - a DLL
+      whose DllMain waits for its original loader (shared sections, a specific
+      parent, a mutex/event, a C2 callback) never returns from LoadLibrary. You
+      then set breakpoints and invoke DllMain / an export yourself.
+
 Using this stub as the debugger "application" lets you debug a DLL through the
-normal Windows loader - including packed samples that unpack themselves inside
-their entry routine (DllMain / TLS) - without relying on ``rundll32.exe`` or
-IDA's built-in loader stub, and without having to guess an exported ordinal.
+Windows loader without relying on ``rundll32.exe`` or IDA's built-in loader
+stub, and without having to guess an exported ordinal.
+
+NOTE on memory dumps: a DLL dumped from memory (e.g. a reflectively-injected
+payload) is usually section-aligned on disk and may not load via LoadLibrary at
+all. The generator warns when the input looks like a raw memory image; realign
+it to file form first, or analyse it under its original loader.
 
 Typical workflow
 -----------------
@@ -87,6 +105,9 @@ IMAGE_NUMBEROF_DIRECTORY_ENTRIES = 16
 
 INFINITE = 0xFFFFFFFF
 
+# LoadLibraryEx flags
+DONT_RESOLVE_DLL_REFERENCES = 0x00000001  # map only: no DllMain, no imports
+
 _LOG_TAG = "[loader-stub]"
 
 
@@ -95,20 +116,60 @@ def _align(value, alignment):
     return (value + alignment - 1) & ~(alignment - 1)
 
 
+def _pe_looks_memory_aligned(data):
+    """Heuristic: does this PE look like a raw memory image (section-aligned on
+    disk) rather than a normal on-disk file? Such images frequently fail to
+    load through LoadLibrary. Returns (is_dump, reason)."""
+    try:
+        if data[:2] != b"MZ":
+            return (False, "")
+        e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+            return (False, "")
+        coff = e_lfanew + 4
+        num_sec = struct.unpack_from("<H", data, coff + 2)[0]
+        opt_size = struct.unpack_from("<H", data, coff + 16)[0]
+        opt = coff + 20
+        sect_align = struct.unpack_from("<I", data, opt + 32)[0]
+        file_align = struct.unpack_from("<I", data, opt + 36)[0]
+        if sect_align and file_align and sect_align == file_align:
+            return (True, "FileAlignment == SectionAlignment (%#x)" % file_align)
+        sec_tbl = opt + opt_size
+        for i in range(min(num_sec, 96)):
+            sh = sec_tbl + i * 40
+            if sh + 40 > len(data):
+                break
+            vaddr = struct.unpack_from("<I", data, sh + 12)[0]
+            praw = struct.unpack_from("<I", data, sh + 20)[0]
+            if vaddr >= max(sect_align, 0x1000) and praw == vaddr:
+                return (True, "section raw pointer == RVA (%#x)" % vaddr)
+        return (False, "")
+    except Exception:
+        return (False, "")
+
+
 # --------------------------------------------------------------------------- #
 # PE builder
 # --------------------------------------------------------------------------- #
-def build_loader_pe(dll_path):
+def build_loader_pe(dll_path, run_dllmain=True, break_after_load=False):
     """Return the bytes of a 64-bit console executable that loads *dll_path*.
 
-    The executable imports ``LoadLibraryW`` and ``Sleep`` from ``kernel32.dll``,
-    calls ``LoadLibraryW(dll_path)`` and then loops on ``Sleep(INFINITE)``.
+    Imports ``LoadLibraryExW`` and ``Sleep`` from ``kernel32.dll`` and calls
+    ``LoadLibraryExW(dll_path, NULL, flags)`` followed by a ``Sleep(INFINITE)``
+    parking loop.
+
+        run_dllmain=True   -> flags = 0 (normal load; DllMain and TLS run).
+        run_dllmain=False  -> flags = DONT_RESOLVE_DLL_REFERENCES (map only; no
+                              DllMain, no import resolution). Use when a normal
+                              load hangs inside the DLL's entry routine.
+        break_after_load   -> emit an ``int3`` right after the load so the
+                              debugger stops with the DLL mapped (debugger only).
     """
     text_rva = SECTION_ALIGNMENT * 1   # 0x1000
     rdata_rva = SECTION_ALIGNMENT * 2  # 0x2000
 
     # ----- .rdata layout: import directory, thunks and strings ----------- #
-    imports = [b"LoadLibraryW", b"Sleep"]  # order defines IAT/ILT slots
+    imports = [b"LoadLibraryExW", b"Sleep"]  # order defines IAT/ILT slots
 
     def _padded(blob):
         return blob + (b"\x00" if len(blob) & 1 else b"")
@@ -168,8 +229,9 @@ def build_loader_pe(dll_path):
 
     # ----- .text: position-independent stub ------------------------------ #
     path_rva = to_rva(path_off)
-    iat_loadlibrary_rva = to_rva(iat_off + 0 * 8)
+    iat_loadlibraryex_rva = to_rva(iat_off + 0 * 8)
     iat_sleep_rva = to_rva(iat_off + 1 * 8)
+    flags = 0 if run_dllmain else DONT_RESOLVE_DLL_REFERENCES
 
     code = bytearray()
 
@@ -184,8 +246,12 @@ def build_loader_pe(dll_path):
     emit(b"\x48\x83\xEC\x28")            # sub rsp, 0x28   (shadow space + align)
     emit(b"\x48\x8D\x0D")                # lea rcx, [rip+dll_path]
     emit(rip_disp32(path_rva))
-    emit(b"\xFF\x15")                    # call [rip+LoadLibraryW]
-    emit(rip_disp32(iat_loadlibrary_rva))
+    emit(b"\x31\xD2")                    # xor edx, edx    (hFile = NULL)
+    emit(b"\x41\xB8" + struct.pack("<I", flags))  # mov r8d, flags
+    emit(b"\xFF\x15")                    # call [rip+LoadLibraryExW]
+    emit(rip_disp32(iat_loadlibraryex_rva))
+    if break_after_load:
+        emit(b"\xCC")                    # int3 (debugger stops here; DLL mapped)
 
     loop_rva = text_rva + len(code)
     emit(b"\xB9" + struct.pack("<I", INFINITE))  # mov ecx, INFINITE
@@ -343,10 +409,13 @@ def _try_configure_debugger(loader_path):
     return False
 
 
-def generate_loader_for_current_dll(auto_configure_debugger=True):
+def generate_loader_for_current_dll(auto_configure_debugger=True,
+                                    run_dllmain=True, break_after_load=True):
     """Generate a loader EXE for the DLL currently open in IDA.
 
-    Returns the path to the generated executable, or ``None`` on failure.
+    run_dllmain=False maps the DLL WITHOUT running DllMain (use when a normal
+    load hangs); break_after_load emits an int3 right after the load. Returns
+    the path to the generated executable, or ``None`` on failure.
     """
     dll_path = ida_nalt.get_input_file_path()
     if not dll_path or not os.path.isfile(dll_path):
@@ -360,16 +429,35 @@ def generate_loader_for_current_dll(auto_configure_debugger=True):
         print("%s Warning: input file does not have a .dll extension; "
               "continuing anyway." % _LOG_TAG)
 
+    # warn if the input looks like a raw memory dump (reflective payloads)
+    try:
+        with open(dll_path, "rb") as fh:
+            head = fh.read(0x1000)
+        is_dump, why = _pe_looks_memory_aligned(head)
+    except Exception:
+        is_dump, why = (False, "")
+    if is_dump:
+        print("%s WARNING: '%s' looks like a raw memory image (%s)."
+              % (_LOG_TAG, os.path.basename(dll_path), why))
+        print("%s          LoadLibrary may fail or misbehave on a memory dump; "
+              "realign it to file form or debug it under the original loader."
+              % _LOG_TAG)
+
     dll_dir = os.path.dirname(dll_path)
     dll_stem = os.path.splitext(os.path.basename(dll_path))[0]
     loader_path = _unique_loader_path(dll_dir, dll_stem)
 
-    pe_bytes = build_loader_pe(dll_path)
+    pe_bytes = build_loader_pe(dll_path, run_dllmain=run_dllmain,
+                               break_after_load=break_after_load)
     with open(loader_path, "wb") as handle:
         handle.write(pe_bytes)
 
+    mode = ("normal (DllMain + TLS run)" if run_dllmain
+            else "map-only (no DllMain, imports unresolved)")
     print("%s Target DLL : %s" % (_LOG_TAG, dll_path))
     print("%s Loader EXE : %s (%d bytes)" % (_LOG_TAG, loader_path, len(pe_bytes)))
+    print("%s Mode       : %s%s" % (_LOG_TAG, mode,
+                                    "; int3 after load" if break_after_load else ""))
 
     if auto_configure_debugger:
         _try_configure_debugger(loader_path)
@@ -379,7 +467,18 @@ def generate_loader_for_current_dll(auto_configure_debugger=True):
     print("    2. Debugger > Process options... > Application = the loader EXE above.")
     print("    3. Enable 'Suspend on library load/unload' to break when the DLL maps.")
     print("    4. Start debugging and set a breakpoint on the DLL entry point (OEP).")
+    print("    5. If the stub HANGS, DllMain is blocking - regenerate with")
+    print("       generate_safe_loader_for_current_dll() to map without DllMain.")
     return loader_path
+
+
+def generate_safe_loader_for_current_dll(auto_configure_debugger=True):
+    """Loader that MAPS the DLL without running DllMain (for samples whose
+    DllMain hangs). Breaks right after the load so you can set breakpoints and
+    drive DllMain / an export yourself."""
+    return generate_loader_for_current_dll(
+        auto_configure_debugger=auto_configure_debugger,
+        run_dllmain=False, break_after_load=True)
 
 
 def main():
@@ -389,17 +488,20 @@ def main():
 
     import sys
 
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         print("Run inside IDA, or for self-testing:")
-        print("    python %s <dll_path> <output_exe>"
+        print("    python %s <dll_path> <output_exe> [safe]"
               % os.path.basename(__file__))
         sys.exit(2)
 
     target = os.path.abspath(sys.argv[1])
     output = sys.argv[2]
+    run_dllmain = not (len(sys.argv) == 4 and sys.argv[3].lower() == "safe")
     with open(output, "wb") as handle:
-        handle.write(build_loader_pe(target))
-    print("Wrote loader: %s" % output)
+        handle.write(build_loader_pe(target, run_dllmain=run_dllmain,
+                                     break_after_load=not run_dllmain))
+    print("Wrote loader: %s (%s)"
+          % (output, "normal" if run_dllmain else "map-only"))
 
 
 if __name__ == "__main__":
