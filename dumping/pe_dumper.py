@@ -793,7 +793,7 @@ def rebuild_imports_for_image(image, pe, modules, mem, iat_rva=None,
 def _fix_imports_ida(image, pe, iat_rva, iat_size, section_name):
     mods = _enumerate_modules()
     if not mods:
-        _log("import fix: no loaded modules found - are you in a debug session?")
+        _log("import fix: no loaded modules found - start a debug session first")
         return None, {"ok": False, "error": "no modules (need a live debugger)"}
     return rebuild_imports_for_image(
         image, pe, mods, lambda ea, size: ida_bytes.get_bytes(ea, size),

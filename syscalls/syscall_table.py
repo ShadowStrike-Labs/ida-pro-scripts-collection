@@ -504,9 +504,10 @@ if _IN_IDA:
             _sl_hk_ctx = ida_kernwin.add_hotkey(_SL_HOTKEY, show_syscalls)
         except Exception:
             pass
-        _sl_log("ready. show_syscalls() opens the table on YOUR Windows "
-                "build (Ctrl-Alt-S); Nt/Zw are collapsed to one row by "
-                "default - use show_syscalls(include_aliases=True) to split. "
+        _sl_log("ready. show_syscalls() opens the table parsed from the "
+                "running system's ntdll/win32u (Ctrl-Alt-S); Nt/Zw are "
+                "collapsed to one row by default - use "
+                "show_syscalls(include_aliases=True) to split. "
                 "syscall_lookup(0x19) and syscall_find('NtClose') from the "
                 "console; refresh_syscalls() after a Windows update.")
 

@@ -1,9 +1,9 @@
 # ============================================================================
-#  segment_scanner.py  -  IDAPython: hunt signatures in the segments YOU choose
+#  segment_scanner.py  -  IDAPython: hunt signatures in chosen segments
 # ----------------------------------------------------------------------------
-#  A targeted scanner, not a blanket sweep. You tell it which segments to look
-#  in (by name, by cursor, by address, or "all") and it reports every hit with
-#  an exact address you can double-click to jump to.
+#  A targeted scanner, not a blanket sweep. The caller picks which segments to
+#  look in (by name, by cursor, by address, or "all") and the tool reports
+#  every hit with an exact address that can be double-clicked to jump to.
 #
 #  It looks for three kinds of thing, each toggleable:
 #     * pe    - MZ headers, validated into "valid PE (arch/type/SizeOfImage)"

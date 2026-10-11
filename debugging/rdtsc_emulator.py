@@ -22,15 +22,17 @@
 #  instruction-pointer/re-arm ambiguity and guarantees the program only ever
 #  sees the emulated value. (See the note near _rd_tick for the trade-off.)
 #
-#  ON YOUR "BP INSIDE vs OUTSIDE the two reads" QUESTION
-#    t1=rdtsc ; [BP here] ; t2=rdtsc   -> WITHOUT this script the wall clock
-#      keeps advancing while you sit at the BP, so t2-t1 explodes and the check
-#      trips. WITH this script both reads are emulated, so t2-t1 stays tiny.
-#    t1=rdtsc ; t2=rdtsc ; [BP here]   -> if you F9 straight through the two
-#      reads the CPU runs them back-to-back at full speed, so the delta is
-#      already small and the check usually passes even without emulation. The
-#      danger is any stop *between* the reads. This script removes the danger
-#      entirely by making the delta deterministic wherever your BPs are.
+#  BREAKPOINT PLACEMENT RELATIVE TO THE TIMER READS
+#    t1=rdtsc ; [BP] ; t2=rdtsc  (BP BETWEEN the reads)
+#      Without this script the wall clock keeps advancing while execution is
+#      halted at the breakpoint, so t2-t1 explodes and the delta check trips.
+#      With this script both reads are emulated, so t2-t1 stays tiny.
+#    t1=rdtsc ; t2=rdtsc ; [BP]  (BP AFTER both reads)
+#      Running straight through both reads under F9 lets the CPU execute them
+#      back-to-back at full speed, so the delta is already small and the
+#      check usually passes even without emulation. The hazard is any stop
+#      *between* the reads. Emulation removes the hazard entirely by making
+#      the delta deterministic regardless of where breakpoints are set.
 #
 #  MODES
 #    Normal (software)  - int3 breakpoints. Simple and fast, but writes 0xCC
@@ -39,7 +41,8 @@
 #      rdtsc_on(stealth=True)). No bytes are changed in the code, so code
 #      integrity / 0xCC scans see nothing. IDA uses the 4 debug registers first
 #      and, when you exceed them, emulates the rest with page-permission
-#      changes (the message you have seen). Trade-offs: the page-emulated
+#      changes (reported by IDA's hardware-BP emulation notice). Trade-offs:
+#      the page-emulated
 #      overflow can be slower because IDA faults on page access, and the DRx
 #      registers / page protections are themselves detectable by other, less
 #      common checks (GetThreadContext, NtQueryVirtualMemory). It defeats the
