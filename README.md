@@ -55,7 +55,7 @@ hotkeys on load.
 ## Contributing
 
 Have an IDAPython script that could be useful for reverse engineering or
-malware analysis? Feel free to contribute it.
+malware analysis? Open a pull request.
 
 Scripts for unpacking, debugging, dumping, scanning, deobfuscation,
 navigation, analysis, and other useful IDA workflows are welcome.
