@@ -1,9 +1,10 @@
 # ============================================================================
-#  pe_dumper.py  -  IDAPython: carve a full PE out of the address space
+#  pe_dumper.py  -  IDAPython: carve Windows binary containers out of memory
 # ----------------------------------------------------------------------------
-#  Point it at any address whose first bytes are the MZ signature (4D 5A ...)
-#  - a decrypted/unpacked payload in the debugger, a PE embedded in a data
-#  blob, a manually-mapped module - and it will:
+#  Primary target is the Portable Executable: pointed at any address whose
+#  first bytes are the MZ signature (4D 5A ...) - a decrypted/unpacked payload
+#  in the debugger, a PE embedded in a data blob, a manually-mapped module -
+#  the tool will:
 #
 #     1. Parse the DOS + PE + optional headers straight out of memory.
 #     2. Work out how big the thing is *by itself*:
@@ -18,6 +19,9 @@
 #        aligned VirtualSize).  "raw" mode writes bytes verbatim instead.
 #     5. Pick the extension from the headers (.dll / .sys / .exe) and drop the
 #        file NEXT TO the analyzed input file (falling back to the IDB folder).
+#        Managed assemblies (.NET) are detected via the CLI header (data
+#        directory 14) and labelled as ".NET" in the report; the file keeps
+#        its native .dll/.exe extension.
 #
 #  6. OPTIONALLY rebuild the import table (fix_imports=True) - the pe-sieve
 #     /imp equivalent: resolve every IAT slot against the modules mapped in the
@@ -25,20 +29,39 @@
 #     new section.  Without this the dump is already perfect for static RE; with
 #     it the file is meant to load.  (Scylla / pe-sieve remain fine too.)
 #
+#  Beyond PE, the tool also carves non-PE containers commonly found embedded
+#  in Windows binaries, memory dumps and shellcode blobs. For each format the
+#  size is derived from the stream itself (no out-of-band guessing):
+#     ZIP (via EOCD),  7z (SignatureHeader),  gzip (DEFLATE stream),
+#     PDF (last %%EOF),  PNG (IEND),  BMP (bfSize + strict DIB check),
+#     CAB (cbCabinet),  RAR4 (block walk to ENDARC_HEAD).
+#  RAR5 is signature-detected; its size requires manual input (size=N).
+#
 #  COMMANDS (from the IDAPython console)
-#    dump_pe()                dump the PE at the cursor (auto layout detect)
-#    dump_pe(0x140000000)     dump the PE at an explicit base
-#    dump_pe(ea, mode="raw")  force raw/on-disk layout (no section fixups)
-#    dump_pe(ea, mode="virtual")   force mapped->file reconstruction
-#    dump_pe(ea, ext=".sys")  force the output extension
-#    dump_pe_prompt()         ask for the address in a dialog (hex)
-#    scan_for_pe()            list every MZ/PE candidate in the address space
-#    dump_all_pe()            dump every candidate scan_for_pe() finds
-#    pe_info(ea)              print the header summary only, dump nothing
-#    save_region(ea, size)    raw blob dump of `size` bytes (no PE parsing)
-#    dump_pe(ea, fix_imports=True)  dump + rebuild imports (needs a debugger)
-#    list_imports(ea)         resolve + print the IAT, write nothing
-#    rebuild_imports_in_file(path)  add imports to an already-dumped file
+#    PE path:
+#      dump_pe()                dump the PE at the cursor (auto layout detect)
+#      dump_pe(0x140000000)     dump the PE at an explicit base
+#      dump_pe(ea, mode="raw")  force raw/on-disk layout (no section fixups)
+#      dump_pe(ea, mode="virtual")   force mapped->file reconstruction
+#      dump_pe(ea, ext=".sys")  force the output extension
+#      dump_pe_prompt()         ask for the address in a dialog (hex)
+#      scan_for_pe()            list every MZ/PE candidate in the address space
+#      dump_all_pe()            dump every candidate scan_for_pe() finds
+#      pe_info(ea)              print the header summary only, dump nothing
+#      save_region(ea, size)    raw blob dump of `size` bytes (no PE parsing)
+#      dump_pe(ea, fix_imports=True)  dump + rebuild imports (needs a debugger)
+#      list_imports(ea)         resolve + print the IAT, write nothing
+#      rebuild_imports_in_file(path)  add imports to an already-dumped file
+#
+#    non-PE containers:
+#      blob_info(ea)            identify + size-probe the container at ea
+#      dump_blob(ea)            carve the container at ea (auto-detect kind)
+#      dump_blob(ea, kind=..., size=N)   force kind / override size
+#      scan_for_blobs()         scan every segment for every supported format
+#      dump_all_blobs()         scan + carve every finding
+#      scan_for_zip() / scan_for_7z() / scan_for_gzip() / scan_for_pdf() /
+#      scan_for_png() / scan_for_bmp() / scan_for_cab() / scan_for_rar()
+#      list_blob_kinds()        print the supported formats
 #
 #  HOTKEY:  Ctrl-Alt-D  ->  dump_pe() at the current cursor.
 #
@@ -111,6 +134,7 @@ DIR_EXPORT = 0
 DIR_IMPORT = 1
 DIR_BOUND = 11
 DIR_IAT = 12
+DIR_COM_DESCRIPTOR = 14          # CLI header: non-zero -> .NET assembly
 
 _ORD_FLAG64 = 0x8000000000000000
 _ORD_FLAG32 = 0x80000000
@@ -215,6 +239,7 @@ class PEHeader(object):
         self.opt_off = 0                   # start of the optional header
         self.dd_off = 0                    # start of the data-directory array
         self.num_rva = 0                   # NumberOfRvaAndSizes
+        self.is_dotnet = False             # CLI header present (COM descriptor)
         self.sections = []                 # list of dicts
 
     @property
@@ -319,6 +344,12 @@ def parse_pe_header(base, mem=None):
     pe.opt_off = opt
     pe.dd_off = opt + (112 if pe.is_64 else 96)
     pe.num_rva = _u32(hdr, (opt + 108) if pe.is_64 else (opt + 92))
+
+    # .NET: non-zero CLI header data directory indicates a managed assembly.
+    if pe.num_rva > DIR_COM_DESCRIPTOR:
+        com_rva = _u32(hdr, pe.dd_off + DIR_COM_DESCRIPTOR * 8)
+        com_size = _u32(hdr, pe.dd_off + DIR_COM_DESCRIPTOR * 8 + 4)
+        pe.is_dotnet = bool(com_rva) and bool(com_size)
 
     # Section table follows the optional header (robust: don't assume by magic).
     pe.sectbl_off = coff + 20 + pe.opt_header_size
@@ -454,10 +485,11 @@ def _fmt_chars(c):
 
 def print_report(pe, chosen_mode=None):
     kind = pe.default_ext()[1:].upper()
+    tag = ".NET assembly" if pe.is_dotnet else kind
     print("%s ---- PE @ %X ----" % (_TAG, pe.base))
     print("%s   arch=%s  magic=%s  type=%s  subsystem=%s"
           % (_TAG, pe.machine_name,
-             "PE32+" if pe.is_64 else "PE32", kind, pe.subsystem_name))
+             "PE32+" if pe.is_64 else "PE32", tag, pe.subsystem_name))
     print("%s   ImageBase=%X  EntryRVA=%X  ->  EP@VA %X"
           % (_TAG, pe.image_base, pe.entry_rva, pe.base + pe.entry_rva))
     print("%s   SizeOfImage=%#x  SizeOfHeaders=%#x  SectAlign=%#x  FileAlign=%#x"
@@ -1075,6 +1107,467 @@ def dump_all_pe(mode=None):
     return paths
 
 
+# ============================================================================
+#  generic blob carvers  -  non-PE containers commonly found on Windows
+# ----------------------------------------------------------------------------
+#  Each handler contributes a signature (used by the scanner) and a probe
+#  function that computes the exact size of the blob from its bytes. Only
+#  formats whose size is derivable from the stream itself are supported with
+#  "exact" confidence; formats where the size requires out-of-band knowledge
+#  are documented as signature-only.
+#
+#  Probe signature:
+#      probe(reader, offset) -> (size:int, detail:str) | None
+#      reader(ea, size) -> bytes          # fetches bytes starting at ea
+#      offset                             # absolute ea where the signature starts
+#  Returning None means the probe is NOT confident; the scanner drops such
+#  hits. For signature-only extraction use dump_blob(ea, kind=..., size=N).
+# ============================================================================
+
+try:
+    import zlib as _zlib
+    _HAVE_ZLIB = True
+except Exception:                            # pragma: no cover
+    _HAVE_ZLIB = False
+
+_BLOB_MAX = 1 * 1024 * 1024 * 1024           # 1 GB per-blob cap (sanity)
+_BLOB_SCAN_STEP = 0x100000                   # chunk size for the memory scanner
+
+
+class _BlobHandler(object):
+    __slots__ = ("name", "ext", "sig", "min_bytes", "probe")
+
+    def __init__(self, name, ext, sig, min_bytes, probe):
+        self.name = name
+        self.ext = ext
+        self.sig = sig
+        self.min_bytes = min_bytes
+        self.probe = probe
+
+
+def _probe_zip(reader, offset):
+    """ZIP (deterministic): find the last EOCD and return start-to-end size."""
+    SIG_EOCD = b"PK\x05\x06"
+    first = reader(offset, 30) or b""
+    if len(first) < 30 or first[:4] != b"PK\x03\x04":
+        return None
+    MAX = min(_BLOB_MAX, 256 * 1024 * 1024)
+    buf = bytes(first)
+    while len(buf) < MAX:
+        more = reader(offset + len(buf),
+                      min(MAX - len(buf), 8 * 1024 * 1024)) or b""
+        if not more:
+            break
+        buf += more
+        if len(more) < 8 * 1024 * 1024:
+            break
+    if not buf:
+        return None
+    last = buf.rfind(SIG_EOCD)
+    if last < 0 or last + 22 > len(buf):
+        return None
+    comment_len = int.from_bytes(buf[last + 20:last + 22], "little")
+    cd_size = int.from_bytes(buf[last + 12:last + 16], "little")
+    cd_offset = int.from_bytes(buf[last + 16:last + 20], "little")
+    total = last + 22 + comment_len
+    if total > len(buf):
+        return None
+    # Plausibility: central-directory record must sit before the EOCD.
+    if cd_offset + cd_size > last and cd_offset != 0xFFFFFFFF:
+        return None
+    return total, "ZIP (EOCD @ +%d, CD @ +%d, size=%d)" % (last, cd_offset,
+                                                           cd_size)
+
+
+def _probe_7z(reader, offset):
+    """7z (deterministic): SignatureHeader @ 0, next_header_offset+size."""
+    hdr = reader(offset, 32) or b""
+    if len(hdr) < 32 or hdr[:6] != b"7z\xbc\xaf\x27\x1c":
+        return None
+    next_off = int.from_bytes(hdr[12:20], "little")
+    next_size = int.from_bytes(hdr[20:28], "little")
+    total = 32 + next_off + next_size
+    if not (32 <= total <= _BLOB_MAX):
+        return None
+    return total, "7z (next_hdr @ +%d, size=%d)" % (32 + next_off, next_size)
+
+
+def _probe_gzip(reader, offset):
+    """gzip (deterministic via zlib): decompress the stream to find its end."""
+    if not _HAVE_ZLIB:
+        return None
+    hdr = reader(offset, 10) or b""
+    if len(hdr) < 10 or hdr[:3] != b"\x1f\x8b\x08":
+        return None
+    d = _zlib.decompressobj(wbits=31)        # 31 = gzip header + DEFLATE
+    consumed = 0
+    STEP = 4 * 1024 * 1024
+    while consumed < _BLOB_MAX:
+        chunk = reader(offset + consumed, STEP) or b""
+        if not chunk:
+            break
+        try:
+            d.decompress(chunk)
+        except Exception:
+            return None
+        if d.eof:
+            unused = len(d.unused_data) if d.unused_data else 0
+            size = consumed + len(chunk) - unused
+            return size, "gzip (DEFLATE stream, %d compressed bytes)" % size
+        consumed += len(chunk)
+        if len(chunk) < STEP:
+            break
+    return None
+
+
+def _probe_pdf(reader, offset):
+    """PDF (scan): header + last %%EOF (handles incremental updates)."""
+    MAX = min(_BLOB_MAX, 128 * 1024 * 1024)
+    buf = reader(offset, min(MAX, 8 * 1024 * 1024)) or b""
+    if len(buf) < 5 or buf[:5] != b"%PDF-":
+        return None
+    while len(buf) < MAX:
+        more = reader(offset + len(buf),
+                      min(MAX - len(buf), 8 * 1024 * 1024)) or b""
+        if not more:
+            break
+        buf += more
+        if len(more) < 8 * 1024 * 1024:
+            break
+    last = buf.rfind(b"%%EOF")
+    if last < 0:
+        return None
+    end = last + 5
+    if end < len(buf) and buf[end] == 0x0D:
+        end += 1
+    if end < len(buf) and buf[end] == 0x0A:
+        end += 1
+    return end, "PDF (%%EOF @ +%d)" % last
+
+
+def _probe_png(reader, offset):
+    """PNG (deterministic): walk chunks until the IEND marker."""
+    hdr = reader(offset, 8) or b""
+    if hdr != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos = 8
+    while pos < _BLOB_MAX:
+        ch = reader(offset + pos, 8) or b""
+        if len(ch) < 8:
+            return None
+        length = int.from_bytes(ch[:4], "big")
+        ctype = ch[4:8]
+        if length > _BLOB_MAX:               # bogus chunk length
+            return None
+        pos += 4 + 4 + length + 4            # size + type + data + CRC
+        if ctype == b"IEND":
+            return pos, "PNG (IEND @ +%d)" % (pos - 12)
+    return None
+
+
+def _probe_bmp(reader, offset):
+    """BMP (strict): BM signature + plausible bfSize, bfOffBits, DIB size."""
+    hdr = reader(offset, 18) or b""
+    if len(hdr) < 18 or hdr[:2] != b"BM":
+        return None
+    bf_size = int.from_bytes(hdr[2:6], "little")
+    bf_off = int.from_bytes(hdr[10:14], "little")
+    bi_size = int.from_bytes(hdr[14:18], "little")
+    # BM is a weak 2-byte signature: strict plausibility prunes false positives.
+    if not (54 <= bf_size <= 500 * 1024 * 1024):
+        return None
+    if not (26 <= bf_off <= bf_size):
+        return None
+    if bi_size not in (12, 40, 52, 56, 64, 108, 124):   # standard DIB headers
+        return None
+    return bf_size, "BMP (bfSize=%d, bfOffBits=%d)" % (bf_size, bf_off)
+
+
+def _probe_cab(reader, offset):
+    """CAB (deterministic): cbCabinet field at offset +8."""
+    hdr = reader(offset, 36) or b""
+    if len(hdr) < 36 or hdr[:4] != b"MSCF":
+        return None
+    cb_cabinet = int.from_bytes(hdr[8:12], "little")
+    cfolder_count = int.from_bytes(hdr[26:28], "little")
+    cfile_count = int.from_bytes(hdr[28:30], "little")
+    if not (36 <= cb_cabinet <= _BLOB_MAX):
+        return None
+    return cb_cabinet, ("CAB (cbCabinet=%d, folders=%d, files=%d)"
+                        % (cb_cabinet, cfolder_count, cfile_count))
+
+
+def _probe_rar4(reader, offset):
+    """RAR4 (block walker): find the ENDARC_HEAD terminator block."""
+    sig = reader(offset, 7) or b""
+    if sig != b"Rar!\x1a\x07\x00":
+        return None
+    pos = 7
+    while pos < _BLOB_MAX:
+        block = reader(offset + pos, 11) or b""
+        if len(block) < 7:
+            return None
+        head_type = block[2]
+        head_flags = int.from_bytes(block[3:5], "little")
+        head_size = int.from_bytes(block[5:7], "little")
+        if head_size == 0:
+            return None                     # bogus/truncated header
+        add_size = 0
+        if (head_flags & 0x8000) and len(block) >= 11:
+            add_size = int.from_bytes(block[7:11], "little")
+        block_total = head_size + add_size
+        pos += block_total
+        if head_type == 0x7B:               # ENDARC_HEAD (end of archive)
+            return pos, "RAR4 (end marker @ +%d)" % (pos - block_total)
+    return None
+
+
+def _probe_rar5(reader, offset):
+    """RAR5 uses vint-encoded block headers; size not implemented. The scanner
+    records nothing for RAR5; use dump_blob(ea, kind='rar', size=N) manually."""
+    return None
+
+
+_BLOB_HANDLERS = [
+    _BlobHandler("zip",  ".zip", b"PK\x03\x04",             30, _probe_zip),
+    _BlobHandler("7z",   ".7z",  b"7z\xbc\xaf\x27\x1c",     32, _probe_7z),
+    _BlobHandler("gzip", ".gz",  b"\x1f\x8b\x08",           18, _probe_gzip),
+    _BlobHandler("pdf",  ".pdf", b"%PDF-",                  32, _probe_pdf),
+    _BlobHandler("png",  ".png", b"\x89PNG\r\n\x1a\n",      16, _probe_png),
+    _BlobHandler("bmp",  ".bmp", b"BM",                     54, _probe_bmp),
+    _BlobHandler("cab",  ".cab", b"MSCF",                   36, _probe_cab),
+    _BlobHandler("rar4", ".rar", b"Rar!\x1a\x07\x00",       11, _probe_rar4),
+    _BlobHandler("rar5", ".rar", b"Rar!\x1a\x07\x01\x00",   12, _probe_rar5),
+]
+
+_BLOB_HANDLERS_BY_NAME = {h.name: h for h in _BLOB_HANDLERS}
+
+
+def _view_reader(ea, n):
+    """Byte reader bound to the current IDA view (live memory while debugging,
+    DB bytes otherwise). Zero-length result on failure."""
+    b = ida_bytes.get_bytes(ea, n)
+    return bytes(b) if b else b""
+
+
+def _normalize_blob_cats(cats):
+    """Return None (all) or a set of handler names. Accepts None, 'all', a
+    string ('zip'), or an iterable of strings."""
+    if cats is None or cats == "all":
+        return None
+    if isinstance(cats, str):
+        cats = (cats,)
+    want = set()
+    for c in cats:
+        c = c.lower()
+        if c in _BLOB_HANDLERS_BY_NAME:
+            want.add(c)
+        elif c == "rar":
+            want.update(("rar4", "rar5"))
+        else:
+            _log("unknown blob kind %r (see list_blob_kinds())" % c)
+    return want or None
+
+
+def list_blob_kinds():
+    """Print the supported non-PE containers and whether they are deterministic."""
+    print("%s supported blob kinds:" % _TAG)
+    for h in _BLOB_HANDLERS:
+        confidence = "signature only" if h.name == "rar5" else "exact size"
+        print("%s   %-6s %s   (%s)" % (_TAG, h.name, h.ext, confidence))
+
+
+def _build_blob_output_path(ea, kind, ext):
+    out_dir, src = _output_dir()
+    stem = os.path.splitext(os.path.basename(src or "dump"))[0] or "dump"
+    name = "%s_dumped_%X_%s%s" % (stem, ea, kind, ext)
+    return _unique_path(os.path.join(out_dir, name))
+
+
+def _detect_blob_at(ea, cats=None):
+    """Match every candidate handler at `ea` and return the first that reports
+    an exact size: (handler, size, detail) or None."""
+    want = _normalize_blob_cats(cats)
+    candidates = [h for h in _BLOB_HANDLERS if want is None or h.name in want]
+    for h in candidates:
+        head = _view_reader(ea, len(h.sig))
+        if head != h.sig:
+            continue
+        res = h.probe(_view_reader, ea)
+        if res:
+            size, detail = res
+            return h, size, detail
+    return None
+
+
+def blob_info(ea=None, kind=None):
+    """Identify the container at `ea` (default cursor) and print the probe
+    result (size + detail) without writing a file."""
+    if ea is None:
+        ea = idc.get_screen_ea()
+    if isinstance(ea, str):
+        ea = int(ea.strip().lower().replace("0x", ""), 16)
+    cats = (kind,) if kind else None
+    hit = _detect_blob_at(ea, cats=cats)
+    if not hit:
+        _log("no recognised container signature at %X (see list_blob_kinds())"
+             % ea)
+        return None
+    h, size, detail = hit
+    _log("%s @ %X  size=%#x  %s" % (h.name, ea, size, detail))
+    return {"kind": h.name, "ext": h.ext, "ea": ea, "size": size,
+            "detail": detail}
+
+
+def scan_for_blobs(cats=None, verbose=True):
+    """Walk every segment and run every blob probe at every signature match.
+    Returns a list of findings:
+        [(ea, kind, ext, size, detail), ...]
+    Only findings whose size could be determined exactly are returned.
+    """
+    want = _normalize_blob_cats(cats)
+    handlers = [h for h in _BLOB_HANDLERS if want is None or h.name in want]
+    if not handlers:
+        _log("scan_for_blobs: no handlers for cats=%r" % cats)
+        return []
+    found = []
+    seen = set()
+    max_sig = max((len(h.sig) for h in handlers), default=0)
+    for seg in _iter_segments():
+        start, end = seg.start_ea, seg.end_ea
+        ea = start
+        prev_tail = b""
+        while ea < end:
+            n = min(_BLOB_SCAN_STEP, end - ea)
+            got = ida_bytes.get_bytes(ea, n) or b""
+            if not got:
+                prev_tail = b""
+                ea += n
+                continue
+            combined = prev_tail + bytes(got)
+            tail_base = ea - len(prev_tail)
+            for h in handlers:
+                pos = 0
+                while True:
+                    i = combined.find(h.sig, pos)
+                    if i < 0:
+                        break
+                    pos = i + 1
+                    abs_ea = tail_base + i
+                    key = (abs_ea, h.name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    res = h.probe(_view_reader, abs_ea)
+                    if not res:
+                        continue
+                    size, detail = res
+                    found.append((abs_ea, h.name, h.ext, size, detail))
+                    if verbose:
+                        _log("%-5s @ %X  size=%#x  %s"
+                             % (h.name, abs_ea, size, detail))
+            prev_tail = combined[-max_sig:] if max_sig else b""
+            ea += n
+    if verbose:
+        _log("scan complete: %d blob(s)" % len(found))
+    return found
+
+
+def dump_blob(ea=None, kind=None, size=None, out_path=None):
+    """Carve the blob at `ea` (default cursor) to disk.
+
+    Auto-detects the format from the signature at `ea`. Pass kind=... to force
+    one (useful for signature-only formats like RAR5 or SFX archives), and
+    size=N to override the probed size (or supply it when none can be
+    probed). Returns the written path, or None on failure.
+    """
+    if ea is None:
+        ea = idc.get_screen_ea()
+    if isinstance(ea, str):
+        ea = int(ea.strip().lower().replace("0x", ""), 16)
+    if ea == BADADDR or ea is None:
+        _log("no address")
+        return None
+
+    kind_name = None
+    ext = None
+    detail = None
+    if kind:
+        h = _BLOB_HANDLERS_BY_NAME.get(kind.lower())
+        if h is None:
+            _log("unknown blob kind %r (see list_blob_kinds())" % kind)
+            return None
+        kind_name = h.name
+        ext = h.ext
+        if size is None:
+            res = h.probe(_view_reader, ea)
+            if res:
+                size, detail = res
+    else:
+        hit = _detect_blob_at(ea)
+        if hit is None:
+            if size is None:
+                _log("no recognised container at %X; pass kind=..., size=... "
+                     "to force a carve (see list_blob_kinds())." % ea)
+                return None
+            # size given with no kind: treat as a raw blob.
+            return save_region(ea, size)
+        h, probed_size, detail = hit
+        kind_name = h.name
+        ext = h.ext
+        size = size if size is not None else probed_size
+
+    if size is None or size <= 0:
+        _log("could not determine a size for %s @ %X; pass size=N" %
+             (kind_name, ea))
+        return None
+    if size > _BLOB_MAX:
+        _log("size %#x exceeds the %d GB sanity cap"
+             % (size, _BLOB_MAX // (1024 ** 3)))
+        return None
+
+    data, missing = _read_region(ea, size)
+    if missing:
+        _log("WARNING: %d/%d bytes were unreadable and zero-filled."
+             % (missing, size))
+
+    path = out_path or _build_blob_output_path(ea, kind_name, ext)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(bytes(data))
+    except Exception as e:
+        _log("write failed: %s" % e)
+        return None
+    if detail:
+        _log("%s @ %X  size=%#x  %s" % (kind_name, ea, size, detail))
+    _log("SAVED %d bytes -> %s" % (size, path))
+    if OPEN_FOLDER_AFTER:
+        _reveal(path)
+    return path
+
+
+def dump_all_blobs(cats=None):
+    """Scan for every blob and dump each finding. Returns the list of paths."""
+    paths = []
+    for ea, kind, _ext, size, _detail in scan_for_blobs(cats=cats, verbose=True):
+        p = dump_blob(ea, kind=kind, size=size)
+        if p:
+            paths.append(p)
+    _log("dumped %d blob(s)" % len(paths))
+    return paths
+
+
+# per-format convenience scanners (symmetry with scan_for_pe())
+def scan_for_zip(verbose=True):  return scan_for_blobs("zip",  verbose=verbose)
+def scan_for_7z(verbose=True):   return scan_for_blobs("7z",   verbose=verbose)
+def scan_for_gzip(verbose=True): return scan_for_blobs("gzip", verbose=verbose)
+def scan_for_pdf(verbose=True):  return scan_for_blobs("pdf",  verbose=verbose)
+def scan_for_png(verbose=True):  return scan_for_blobs("png",  verbose=verbose)
+def scan_for_bmp(verbose=True):  return scan_for_blobs("bmp",  verbose=verbose)
+def scan_for_cab(verbose=True):  return scan_for_blobs("cab",  verbose=verbose)
+def scan_for_rar(verbose=True):  return scan_for_blobs("rar",  verbose=verbose)
+
+
 # ----------------------------------------------------------------------------
 # misc
 # ----------------------------------------------------------------------------
@@ -1141,6 +1634,9 @@ def _bootstrap():
     _log("ready. dump_pe() / dump_pe(0xBASE[,fix_imports=True]) / dump_pe_prompt() "
          "/ scan_for_pe() / dump_all_pe() / pe_info(ea) / list_imports(ea) / "
          "rebuild_imports_in_file(path) / save_region(ea,size). "
+         "Blobs: dump_blob(ea) / blob_info(ea) / scan_for_blobs() / "
+         "dump_all_blobs() / list_blob_kinds() "
+         "(ZIP, 7z, gzip, PDF, PNG, BMP, CAB, RAR4; RAR5 signature-only). "
          "Modes: auto|virtual|raw. Output goes next to the analyzed file.")
 
 

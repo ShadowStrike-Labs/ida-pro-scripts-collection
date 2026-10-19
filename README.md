@@ -15,7 +15,7 @@ day.
 ```
 IDA_PRO_SCRIPTS/
 ├── dumping/
-│   ├── pe_dumper.py                 # carve a full PE out of memory -> .exe/.dll/.sys
+│   ├── pe_dumper.py                 # carve PE/.NET and ZIP/7z/gzip/PDF/PNG/BMP/CAB/RAR out of memory
 │   └── dump_bytes.py                # export a byte range as a Python list literal
 ├── navigation/
 │   └── function_conditions.py       # map every condition in the current function
@@ -38,6 +38,9 @@ IDA_PRO_SCRIPTS/
 │   └── dll_loader_stub_generator.py # build a minimal EXE that loads a DLL with LoadLibrary
 ├── syscalls/
 │   └── syscall_table.py             # live Windows syscall table parsed from this machine's ntdll
+├── malware_analysis_lab/
+│   ├── Defender_Disabler/           # disable Windows Defender in a disposable analysis VM
+│   └── Anti_VM/                     # four-tier VMware anti-detection playbook (White->Red)
 ├── notes/
 │   └── vm_handlers.txt              # analysis notes / scratch data
 └── logs/                            # runtime logs (gitignored)
