@@ -7,7 +7,7 @@
 #
 #  It looks for three kinds of thing, each toggleable:
 #     * pe    - MZ headers, validated into "valid PE (arch/type/SizeOfImage)"
-#               vs "MZ (no PE header)". This is what feeds pe_dumper.
+#               vs "MZ (no PE header)". This is what feeds blob_dumper.
 #     * code  - x86-64 function-prologue fingerprints (sub rsp / mov [rsp],reg /
 #               push rbp;mov rbp,rsp / ...). HEURISTIC by nature.
 #     * magic - other embedded payloads (ELF, ZIP, GZIP, PDF, PNG, 7z, CAB, ...)
@@ -29,7 +29,7 @@
 #    scan_exec()                    scan only executable segments
 #    scan_range(lo, hi)             scan an arbitrary address range
 #    rescan()                       repeat the last scan
-#    dump(n)                        dump hit #n with pe_dumper.dump_pe (if loaded)
+#    dump(n)                        dump hit #n with blob_dumper.dump_pe (if loaded)
 #    goto_hit(n)                    jump to hit #n from the last listing
 #
 #  HOTKEY:  Ctrl-Alt-S  ->  scan() on the segment under the cursor.
@@ -568,14 +568,14 @@ def _ss_get_dumper():
 
 
 def dump(n=0):
-    """Dump hit #n via pe_dumper.dump_pe (must be loaded in this session)."""
+    """Dump hit #n via blob_dumper.dump_pe (must be loaded in this session)."""
     if not _ss_last_rows or n < 0 or n >= len(_ss_last_rows):
         _ss_log("no such hit (have %d)" % len(_ss_last_rows))
         return None
     ea = _ss_last_rows[n]["ea"]
     fn = _ss_get_dumper()
     if fn is None:
-        _ss_log("dump_pe not found - load dumping/pe_dumper.py, then "
+        _ss_log("dump_pe not found - load dumping/blob_dumper.py, then "
                 "dump_pe(0x%X)" % ea)
         return None
     _ss_log("handing 0x%X to dump_pe()" % ea)
