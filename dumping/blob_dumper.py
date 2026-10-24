@@ -1186,12 +1186,10 @@ def save_region(ea, size, name=None):
 # scanning helpers
 # ----------------------------------------------------------------------------
 def _get_segment(i):
-    """Fetch segment #i without the IDA 9.x DeprecationWarning. Uses
-    get_segment_info_by_num() when available, otherwise falls back to
-    getnseg() with the warning silenced."""
-    fn = getattr(ida_segment, "get_segment_info_by_num", None)
-    if fn is not None:
-        return fn(i)
+    """Fetch segment #i without the IDA 9.x DeprecationWarning noise. The
+    modern get_segment_info_by_num() has a different output type (segment_info_t
+    vs segment_t) and an out-parameter signature, so getnseg() stays here with
+    the warning silenced - same pattern used across the rest of the collection."""
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return ida_segment.getnseg(i)
