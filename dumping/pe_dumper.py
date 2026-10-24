@@ -57,11 +57,24 @@
 #      blob_info(ea)            identify + size-probe the container at ea
 #      dump_blob(ea)            carve the container at ea (auto-detect kind)
 #      dump_blob(ea, kind=..., size=N)   force kind / override size
-#      scan_for_blobs()         scan every segment for every supported format
-#      dump_all_blobs()         scan + carve every finding
+#      scan_for_blobs()         scan every segment + overlay for every format
+#      dump_all_blobs()         scan + carve every finding (seg + file-space)
 #      scan_for_zip() / scan_for_7z() / scan_for_gzip() / scan_for_pdf() /
 #      scan_for_png() / scan_for_bmp() / scan_for_cab() / scan_for_rar()
 #      list_blob_kinds()        print the supported formats
+#
+#    overlay / off-image (bytes NOT loaded as IDA segments):
+#      The scanners above also walk the input file's overlay (bytes past the
+#      last section on disk) and any inter-section gaps, so appended droppers,
+#      SFX wrappers and signed-binary overlays are found. Findings carry a
+#      source tag:
+#          scan_for_pe()    -> [(source, locator), ...]
+#          scan_for_blobs() -> [(source, locator, kind, ext, size, detail), ...]
+#        source="seg"  -> locator is an EA (use dump_pe/dump_blob)
+#        source="file" -> locator is a byte offset in the input file; carve
+#                         with dump_pe_from_file(offset) or
+#                         dump_blob_from_file(offset[, kind=..., size=N])
+#      dump_all_pe() and dump_all_blobs() dispatch automatically.
 #
 #  HOTKEY:  Ctrl-Alt-D  ->  dump_pe() at the current cursor.
 #
@@ -72,6 +85,7 @@
 
 import os
 import struct
+import warnings
 
 import ida_bytes
 import ida_kernwin
@@ -439,6 +453,115 @@ def _build_output_path(pe, ext):
     out_dir, src = _output_dir()
     stem = os.path.splitext(os.path.basename(src or "dump"))[0] or "dump"
     name = "%s_dumped_%X%s" % (stem, pe.base, ext)
+    return _unique_path(os.path.join(out_dir, name))
+
+
+# ----------------------------------------------------------------------------
+# file-space helpers  (bytes NOT mapped as IDA segments)
+# ----------------------------------------------------------------------------
+#  When IDA loads a PE, only its sections become segments. The overlay (bytes
+#  past the last section's PointerToRawData + SizeOfRawData on disk) is not
+#  mapped and ida_bytes.get_bytes cannot see it, so the segment-only scanners
+#  miss PEs and archives appended there - a common installer / dropper / SFX
+#  layout. The helpers below read the input file from disk and expose the
+#  portions NOT covered by any loaded section (overlay + inter-section gaps),
+#  so the scanners can walk the uncovered bytes alongside the live view.
+# ----------------------------------------------------------------------------
+_FILE_CACHE = {"path": None, "data": None}
+
+
+def _input_file_bytes():
+    """Return (bytes, path) for the current IDA input file (cached by path).
+    Returns (None, None) when the input is unavailable (no path, remote-only
+    load, deleted, unreadable, etc.)."""
+    try:
+        path = ida_nalt.get_input_file_path()
+    except Exception:
+        return None, None
+    if not path or not os.path.isfile(path):
+        return None, None
+    if _FILE_CACHE["path"] != path or _FILE_CACHE["data"] is None:
+        try:
+            with open(path, "rb") as fh:
+                _FILE_CACHE["data"] = fh.read()
+                _FILE_CACHE["path"] = path
+        except Exception as e:
+            _log("could not read input file %s: %s" % (path, e))
+            _FILE_CACHE["data"] = None
+            _FILE_CACHE["path"] = None
+    return _FILE_CACHE["data"], _FILE_CACHE["path"]
+
+
+def _file_reader(data):
+    """Build a reader(offset, n) -> bytes over `data`. The offset argument is
+    treated as an absolute offset into `data` so parse_pe_header(base=offset,
+    mem=reader) parses an embedded PE at that offset correctly."""
+    def _r(offset, n):
+        if offset is None or offset < 0 or offset >= len(data):
+            return b""
+        return bytes(data[offset:offset + n])
+    return _r
+
+
+def _pe_section_covered_ranges(data):
+    """Return the file-offset ranges a loaded PE's headers + sections occupy
+    on disk. For a non-PE or malformed PE input, returns []. Used by
+    _pe_overlay_ranges to compute the complement (uncovered bytes)."""
+    if len(data) < 0x40 or data[:2] != _MZ:
+        return []
+    e_lfanew = _u32(data, 0x3C)
+    if e_lfanew + 24 > len(data) or _u32(data, e_lfanew) != _PE_SIG:
+        return []
+    coff = e_lfanew + 4
+    num_sec = _u16(data, coff + 2)
+    opt_size = _u16(data, coff + 16)
+    opt = coff + 20
+    size_of_headers = _u32(data, opt + 60)
+    ranges = []
+    if 0 < size_of_headers <= len(data):
+        ranges.append((0, size_of_headers))
+    sec_tbl = coff + 20 + opt_size
+    for i in range(min(num_sec, 96)):
+        so = sec_tbl + i * 40
+        if so + 40 > len(data):
+            break
+        praw = _u32(data, so + 20)
+        rsize = _u32(data, so + 16)
+        if praw and rsize:
+            end = min(praw + rsize, len(data))
+            ranges.append((praw, end))
+    return ranges
+
+
+def _pe_overlay_ranges(data):
+    """Return the file-offset ranges NOT covered by loaded PE sections, as
+    [(offset, length), ...]. For a non-PE input the whole file is one range.
+    Primary use: scanning the overlay + inter-section gaps for embeds."""
+    covered = _pe_section_covered_ranges(data)
+    if not covered:
+        return [(0, len(data))]
+    covered.sort()
+    merged = []
+    for s, e in covered:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append([s, e])
+    gaps = []
+    cursor = 0
+    for s, e in merged:
+        if cursor < s:
+            gaps.append((cursor, s - cursor))
+        cursor = max(cursor, e)
+    if cursor < len(data):
+        gaps.append((cursor, len(data) - cursor))
+    return gaps
+
+
+def _build_blob_output_path_file(offset, kind, ext):
+    out_dir, src = _output_dir()
+    stem = os.path.splitext(os.path.basename(src or "dump"))[0] or "dump"
+    name = "%s_overlay_%X_%s%s" % (stem, offset, kind, ext)
     return _unique_path(os.path.join(out_dir, name))
 
 
@@ -1062,49 +1185,156 @@ def save_region(ea, size, name=None):
 # ----------------------------------------------------------------------------
 # scanning helpers
 # ----------------------------------------------------------------------------
+def _get_segment(i):
+    """Fetch segment #i without the IDA 9.x DeprecationWarning. Uses
+    get_segment_info_by_num() when available, otherwise falls back to
+    getnseg() with the warning silenced."""
+    fn = getattr(ida_segment, "get_segment_info_by_num", None)
+    if fn is not None:
+        return fn(i)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return ida_segment.getnseg(i)
+
+
 def _iter_segments():
     n = ida_segment.get_segm_qty()
     for i in range(n):
-        seg = ida_segment.getnseg(i)
+        seg = _get_segment(i)
         if seg:
             yield seg
 
 
 def scan_for_pe(verbose=True):
     """Walk every segment on SCAN_STEP boundaries and MZ+PE-verify each hit.
-    Returns a list of base addresses that parse as a PE."""
+    Also walk the input file's overlay and inter-section gaps (bytes NOT
+    loaded as IDA segments) so embedded droppers / SFX payloads are caught.
+
+    Returns a list of 2-tuples (source, locator):
+      source="seg"  -> locator is an effective address
+      source="file" -> locator is a byte offset into the input file
+    Use dump_pe(ea) for seg findings and dump_pe_from_file(offset) for file
+    findings (dump_all_pe() dispatches on source automatically)."""
     found = []
-    seen = set()
+    seen_seg = set()
+    seen_file = set()
+
+    # 1. loaded segments (the live view)
     for seg in _iter_segments():
         ea = seg.start_ea
-        # align up to the scan step
         ea = _align_up(ea, SCAN_STEP) if SCAN_STEP > 1 else ea
         while ea < seg.end_ea:
             sig = ida_bytes.get_bytes(ea, 2)
-            if sig == _MZ and ea not in seen:
+            if sig == _MZ and ea not in seen_seg:
                 pe = parse_pe_header(ea)
                 if pe is not None:
-                    found.append(ea)
-                    seen.add(ea)
+                    found.append(("seg", ea))
+                    seen_seg.add(ea)
                     if verbose:
-                        _log("PE candidate @ %X  %s  %s  SizeOfImage=%#x"
+                        _log("PE candidate (seg)  @ %012X   %s %s  SizeOfImage=%#x"
                              % (ea, pe.machine_name, pe.default_ext(),
                                 pe.size_of_image))
             ea += SCAN_STEP
+
+    # 2. file-space: overlay + inter-section gaps (not visible to the view)
+    data, _path = _input_file_bytes()
+    if data:
+        reader = _file_reader(data)
+        for off, length in _pe_overlay_ranges(data):
+            if length < 0x40:
+                continue
+            pos = off
+            end = off + length
+            while pos < end:
+                i = data.find(_MZ, pos, end)
+                if i < 0 or i + 0x40 > end:
+                    break
+                pos = i + 2
+                if i in seen_file:
+                    continue
+                pe = parse_pe_header(i, mem=reader)
+                if pe is not None:
+                    found.append(("file", i))
+                    seen_file.add(i)
+                    if verbose:
+                        _log("PE candidate (file) @ FILE+%08X  %s %s  SizeOfImage=%#x"
+                             % (i, pe.machine_name, pe.default_ext(),
+                                pe.size_of_image))
+
     if verbose:
         _log("scan complete: %d PE candidate(s)" % len(found))
     return found
 
 
 def dump_all_pe(mode=None):
-    """Dump every candidate scan_for_pe() finds. Returns list of written paths."""
+    """Dump every candidate scan_for_pe() finds (both loaded and overlay).
+    Returns the list of written paths."""
     paths = []
-    for base in scan_for_pe(verbose=True):
-        p = dump_pe(base, mode=mode)
+    for source, loc in scan_for_pe(verbose=True):
+        if source == "seg":
+            p = dump_pe(loc, mode=mode)
+        else:          # "file"
+            p = dump_pe_from_file(loc)
         if p:
             paths.append(p)
     _log("dumped %d file(s)" % len(paths))
     return paths
+
+
+def dump_pe_from_file(offset, ext=None, out_path=None, file_path=None):
+    """Dump a PE embedded at file offset `offset` in the input file (overlay
+    or an inter-section gap). The PE is written in RAW layout (bytes verbatim
+    from the on-disk file, which is already in file layout).
+
+    Pass file_path=... to point at a different file than the current IDA input.
+    """
+    if file_path:
+        try:
+            with open(file_path, "rb") as fh:
+                data = fh.read()
+        except Exception as e:
+            _log("open failed: %s" % e)
+            return None
+    else:
+        data, _path = _input_file_bytes()
+        if not data:
+            _log("no input file available for file-space dump")
+            return None
+    if isinstance(offset, str):
+        offset = int(offset.strip().lower().replace("0x", ""), 16)
+    if offset + 0x40 > len(data) or data[offset:offset + 2] != _MZ:
+        _log("no MZ at FILE+%X" % offset)
+        return None
+    reader = _file_reader(data)
+    pe = parse_pe_header(offset, mem=reader)
+    if pe is None:
+        _log("no valid PE at FILE+%X" % offset)
+        return None
+    size = pe.raw_extent()
+    if size <= 0:
+        size = min(len(data) - offset, _BLOB_MAX)
+    if offset + size > len(data):
+        _log("overlay PE extends past end-of-file; clamping (%d -> %d)"
+             % (size, len(data) - offset))
+        size = len(data) - offset
+    image = bytes(data[offset:offset + size])
+    if ext is None:
+        ext = pe.default_ext()
+    elif not ext.startswith("."):
+        ext = "." + ext
+    path = out_path or _build_blob_output_path_file(offset, "pe", ext)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(image)
+    except Exception as e:
+        _log("write failed: %s" % e)
+        return None
+    tag = ".NET" if pe.is_dotnet else pe.default_ext()[1:].upper()
+    _log("PE %s @ FILE+%X  %s  size=%#x" % (tag, offset, pe.machine_name, size))
+    _log("SAVED %d bytes -> %s" % (size, path))
+    if OPEN_FOLDER_AFTER:
+        _reveal(path)
+    return path
 
 
 # ============================================================================
@@ -1420,9 +1650,13 @@ def blob_info(ea=None, kind=None):
 
 
 def scan_for_blobs(cats=None, verbose=True):
-    """Walk every segment and run every blob probe at every signature match.
-    Returns a list of findings:
-        [(ea, kind, ext, size, detail), ...]
+    """Walk every segment and the input file's overlay / inter-section gaps,
+    running every blob probe at every signature match.
+
+    Returns a list of 6-tuples:
+        (source, locator, kind, ext, size, detail)
+      source="seg"  -> locator is an effective address (in the IDA view)
+      source="file" -> locator is a byte offset in the input file
     Only findings whose size could be determined exactly are returned.
     """
     want = _normalize_blob_cats(cats)
@@ -1433,6 +1667,8 @@ def scan_for_blobs(cats=None, verbose=True):
     found = []
     seen = set()
     max_sig = max((len(h.sig) for h in handlers), default=0)
+
+    # 1. loaded segments (the live view)
     for seg in _iter_segments():
         start, end = seg.start_ea, seg.end_ea
         ea = start
@@ -1454,7 +1690,7 @@ def scan_for_blobs(cats=None, verbose=True):
                         break
                     pos = i + 1
                     abs_ea = tail_base + i
-                    key = (abs_ea, h.name)
+                    key = ("seg", abs_ea, h.name)
                     if key in seen:
                         continue
                     seen.add(key)
@@ -1462,15 +1698,147 @@ def scan_for_blobs(cats=None, verbose=True):
                     if not res:
                         continue
                     size, detail = res
-                    found.append((abs_ea, h.name, h.ext, size, detail))
+                    found.append(("seg", abs_ea, h.name, h.ext, size, detail))
                     if verbose:
-                        _log("%-5s @ %X  size=%#x  %s"
+                        _log("%-5s @ %012X   size=%#x  %s"
                              % (h.name, abs_ea, size, detail))
             prev_tail = combined[-max_sig:] if max_sig else b""
             ea += n
+
+    # 2. file-space: overlay + inter-section gaps (not visible to the view)
+    data, _path = _input_file_bytes()
+    if data:
+        reader = _file_reader(data)
+        for off, length in _pe_overlay_ranges(data):
+            if length < max_sig:
+                continue
+            region_end = off + length
+            for h in handlers:
+                pos = off
+                while pos < region_end:
+                    i = data.find(h.sig, pos, region_end)
+                    if i < 0:
+                        break
+                    pos = i + 1
+                    key = ("file", i, h.name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    res = h.probe(reader, i)
+                    if not res:
+                        continue
+                    size, detail = res
+                    found.append(("file", i, h.name, h.ext, size, detail))
+                    if verbose:
+                        _log("%-5s @ FILE+%08X  size=%#x  %s"
+                             % (h.name, i, size, detail))
+
     if verbose:
         _log("scan complete: %d blob(s)" % len(found))
     return found
+
+
+def dump_blob_from_file(offset, kind=None, size=None, out_path=None,
+                        file_path=None):
+    """Carve a blob from the input file at `offset` (bytes-in-file, not an
+    effective address). Pass kind= to force a format or size= to override the
+    probed size. file_path= points at a file other than the current input."""
+    if file_path:
+        try:
+            with open(file_path, "rb") as fh:
+                data = fh.read()
+        except Exception as e:
+            _log("open failed: %s" % e)
+            return None
+    else:
+        data, _path = _input_file_bytes()
+        if not data:
+            _log("no input file available for file-space dump")
+            return None
+    if isinstance(offset, str):
+        offset = int(offset.strip().lower().replace("0x", ""), 16)
+    if offset < 0 or offset >= len(data):
+        _log("offset FILE+%X is outside the file (size=%#x)"
+             % (offset, len(data)))
+        return None
+    reader = _file_reader(data)
+    kind_name = None
+    ext = None
+    detail = None
+    if kind:
+        h = _BLOB_HANDLERS_BY_NAME.get(kind.lower())
+        if h is None:
+            _log("unknown blob kind %r (see list_blob_kinds())" % kind)
+            return None
+        kind_name = h.name
+        ext = h.ext
+        if size is None:
+            res = h.probe(reader, offset)
+            if res:
+                size, detail = res
+    else:
+        hit = None
+        for h in _BLOB_HANDLERS:
+            head = reader(offset, len(h.sig))
+            if head != h.sig:
+                continue
+            res = h.probe(reader, offset)
+            if res:
+                hit = (h, res[0], res[1])
+                break
+        if hit is None:
+            if size is None:
+                _log("no recognised container at FILE+%X; pass kind= / size="
+                     % offset)
+                return None
+        else:
+            h, probed_size, detail = hit
+            kind_name = h.name
+            ext = h.ext
+            if size is None:
+                size = probed_size
+    if size is None or size <= 0:
+        _log("could not determine a size for FILE+%X; pass size=N" % offset)
+        return None
+    if offset + size > len(data):
+        _log("blob extends past end-of-file; clamping (%d -> %d)"
+             % (size, len(data) - offset))
+        size = len(data) - offset
+    if size > _BLOB_MAX:
+        _log("size %#x exceeds the %d GB sanity cap"
+             % (size, _BLOB_MAX // (1024 ** 3)))
+        return None
+    label = kind_name or "raw"
+    ext = ext or ".bin"
+    path = out_path or _build_blob_output_path_file(offset, label, ext)
+    try:
+        with open(path, "wb") as fh:
+            fh.write(bytes(data[offset:offset + size]))
+    except Exception as e:
+        _log("write failed: %s" % e)
+        return None
+    if detail:
+        _log("%s @ FILE+%X  size=%#x  %s" % (label, offset, size, detail))
+    _log("SAVED %d bytes -> %s" % (size, path))
+    if OPEN_FOLDER_AFTER:
+        _reveal(path)
+    return path
+
+
+def dump_all_blobs(cats=None):
+    """Scan for every blob (segments + overlay) and dump each finding.
+    Returns the list of written paths."""
+    paths = []
+    for source, loc, kind, _ext, size, _detail in scan_for_blobs(
+            cats=cats, verbose=True):
+        if source == "seg":
+            p = dump_blob(loc, kind=kind, size=size)
+        else:              # "file"
+            p = dump_blob_from_file(loc, kind=kind, size=size)
+        if p:
+            paths.append(p)
+    _log("dumped %d blob(s)" % len(paths))
+    return paths
 
 
 def dump_blob(ea=None, kind=None, size=None, out_path=None):
@@ -1546,15 +1914,6 @@ def dump_blob(ea=None, kind=None, size=None, out_path=None):
     return path
 
 
-def dump_all_blobs(cats=None):
-    """Scan for every blob and dump each finding. Returns the list of paths."""
-    paths = []
-    for ea, kind, _ext, size, _detail in scan_for_blobs(cats=cats, verbose=True):
-        p = dump_blob(ea, kind=kind, size=size)
-        if p:
-            paths.append(p)
-    _log("dumped %d blob(s)" % len(paths))
-    return paths
 
 
 # per-format convenience scanners (symmetry with scan_for_pe())
@@ -1637,6 +1996,9 @@ def _bootstrap():
          "Blobs: dump_blob(ea) / blob_info(ea) / scan_for_blobs() / "
          "dump_all_blobs() / list_blob_kinds() "
          "(ZIP, 7z, gzip, PDF, PNG, BMP, CAB, RAR4; RAR5 signature-only). "
+         "Overlay / off-image: scanners also walk the input file's overlay + "
+         "inter-section gaps; dump_pe_from_file(offset) and "
+         "dump_blob_from_file(offset) carve those findings. "
          "Modes: auto|virtual|raw. Output goes next to the analyzed file.")
 
 
