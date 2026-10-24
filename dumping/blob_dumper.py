@@ -1,5 +1,5 @@
 # ============================================================================
-#  pe_dumper.py  -  IDAPython: carve Windows binary containers out of memory
+#  blob_dumper.py  -  IDAPython: carve Windows binary containers out of memory
 # ----------------------------------------------------------------------------
 #  Primary target is the Portable Executable: pointed at any address whose
 #  first bytes are the MZ signature (4D 5A ...) - a decrypted/unpacked payload
@@ -153,7 +153,7 @@ DIR_COM_DESCRIPTOR = 14          # CLI header: non-zero -> .NET assembly
 _ORD_FLAG64 = 0x8000000000000000
 _ORD_FLAG32 = 0x80000000
 
-_TAG = "[pe_dumper]"
+_TAG = "[blob_dumper]"
 
 
 # ----------------------------------------------------------------------------

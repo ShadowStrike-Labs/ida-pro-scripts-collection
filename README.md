@@ -15,7 +15,7 @@ day.
 ```
 IDA_PRO_SCRIPTS/
 ├── dumping/
-│   ├── pe_dumper.py                 # carve PE/.NET and ZIP/7z/gzip/PDF/PNG/BMP/CAB/RAR out of memory
+│   ├── blob_dumper.py               # carve PE/.NET and ZIP/7z/gzip/PDF/PNG/BMP/CAB/RAR out of memory + overlay
 │   └── dump_bytes.py                # export a byte range as a Python list literal
 ├── navigation/
 │   └── function_conditions.py       # map every condition in the current function
